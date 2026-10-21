@@ -1,6 +1,6 @@
 import { addCents, normalizeCents, usdToUnits, unitsToCents } from "@paperclipai/shared";
 import { and, eq, gte, inArray, lt, or, sql, type SQL } from "drizzle-orm";
-import { budgetPolicies, budgetReservations, costEvents, heartbeatRuns, nativeRunFinalizations, type Db } from "@paperclipai/db";
+import { budgetPolicies, budgetReservations, browserUseRuns, browserUseSessions, costEvents, heartbeatRuns, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import { withBudgetSpan } from "./budget-tracing.js";
 
 export interface BudgetExposure {
@@ -9,6 +9,8 @@ export interface BudgetExposure {
   effectiveHeldCents: string;
   pendingTerminalRunCount: number;
   unpricedEventCount: number;
+  /** Unconfirmed hosted browser POSTs, separate from ledger data quality. */
+  unknownBrowserRunCount: number;
 }
 
 export type SpendPolicy = Pick<typeof budgetPolicies.$inferSelect, "companyId" | "scopeType" | "scopeId" | "windowKind" | "metric">;
@@ -71,8 +73,8 @@ const liveCost = sql`case when ${heartbeatRuns.costAccountedAt} is null and ${he
 async function readObservedSpends(db: Db, policies: SpendPolicy[], now: Date): Promise<ObservedSpend[]> {
   const windows = policies.map(policy => budgetWindow(policy.windowKind, now));
   const billable = policies.map((policy, index) => ({ policy, index })).filter(({ policy }) => policy.metric === "billed_cents");
-  const ledgerColumns: Record<string, SQL> = {}, heldColumns: Record<string, SQL> = {}, runColumns: Record<string, SQL> = {};
-  const ledgerPredicates: SQL[] = [], heldPredicates: SQL[] = [], runPredicates: SQL[] = [];
+  const ledgerColumns: Record<string, SQL> = {}, heldColumns: Record<string, SQL> = {}, runColumns: Record<string, SQL> = {}, browserColumns: Record<string, SQL> = {};
+  const ledgerPredicates: SQL[] = [], heldPredicates: SQL[] = [], runPredicates: SQL[] = [], browserPredicates: SQL[] = [];
   for (const { policy, index } of billable) {
     const { start, end } = windows[index];
     const ledger = and(eq(costEvents.companyId, policy.companyId),
@@ -82,6 +84,17 @@ async function readObservedSpends(db: Db, policies: SpendPolicy[], now: Date): P
     const held = and(eq(budgetReservations.companyId, policy.companyId), eq(budgetReservations.state, "held"),
       policy.scopeType === "agent" ? eq(budgetReservations.agentId, policy.scopeId) : undefined,
       policy.scopeType === "project" ? eq(budgetReservations.projectId, policy.scopeId) : undefined)!;
+    // Hosted browser work is a separate paid operation from its parent run.
+    // Its durable hold survives unknown POST outcomes and monthly rollover.
+    const browserHold = sql`${browserUseRuns.result}->'paperclipBudgetHold'`;
+    const browser = and(eq(browserUseRuns.companyId, policy.companyId), eq(browserUseSessions.companyId, policy.companyId),
+      sql`${browserHold}->>'state' = 'held'`,
+      sql`${browserHold}->>'invocationId' = ${browserUseRuns.invocationId}::text`,
+      policy.scopeType === "agent" ? eq(browserUseSessions.agentId, policy.scopeId) : undefined,
+      policy.scopeType === "project" ? sql`${browserHold}->>'projectId' = ${policy.scopeId}` : undefined)!;
+    browserPredicates.push(browser);
+    browserColumns[`held${index}`] = sql`coalesce(sum(${normalizedNumericCents(sql`${browserHold}->>'amountCents'`)}) filter (where ${browser}), 0)::text`;
+    browserColumns[`unknown${index}`] = sql`count(*) filter (where ${browser} and ${browserHold}->>'billingUnknown' = 'true')::int`;
     const inWindow = policy.windowKind === "calendar_month_utc"
       ? sql`coalesce(${heartbeatRuns.finishedAt}, ${now.toISOString()}::timestamptz) >= ${start.toISOString()}::timestamptz
         and coalesce(${heartbeatRuns.finishedAt}, ${now.toISOString()}::timestamptz) < ${end.toISOString()}::timestamptz` : sql`true`;
@@ -114,15 +127,18 @@ async function readObservedSpends(db: Db, policies: SpendPolicy[], now: Date): P
     .leftJoin(heartbeatRuns, and(eq(heartbeatRuns.id, budgetReservations.runId), eq(heartbeatRuns.companyId, budgetReservations.companyId)))
     .where(or(...heldPredicates)) : [];
   const [runs = {}] = billable.length ? await db.select(runColumns).from(heartbeatRuns).where(or(...runPredicates)) : [];
+  const [browser = {}] = billable.length ? await db.select(browserColumns).from(browserUseRuns)
+    .innerJoin(browserUseSessions, and(eq(browserUseSessions.id, browserUseRuns.sessionId), eq(browserUseSessions.companyId, browserUseRuns.companyId)))
+    .where(or(...browserPredicates)) : [];
   return policies.map((_, index) => {
     const ledgerCents = normalizeCents(String(ledger[`total${index}`] ?? 0));
     const liveObservedCents = normalizeCents(String(runs[`live${index}`] ?? 0));
     const totalExact = addCents(ledgerCents, liveObservedCents);
     const pendingRunCount = Number(runs[`pending${index}`] ?? 0);
     return { windowStart: windows[index].start, windowEnd: windows[index].end,
-      ledgerCents, liveObservedCents, effectiveHeldCents: addCents(String(held[`held${index}`] ?? 0), String(runs[`unreserved${index}`] ?? 0)),
+      ledgerCents, liveObservedCents, effectiveHeldCents: addCents(String(held[`held${index}`] ?? 0), String(runs[`unreserved${index}`] ?? 0), String(browser[`held${index}`] ?? 0)),
       total: Number(totalExact), totalExact, pendingRunCount, pendingTerminalRunCount: pendingRunCount,
-      unpricedEventCount: Number(ledger[`unpriced${index}`] ?? 0), recoveringRunCount: Number(runs[`recovering${index}`] ?? 0) };
+      unpricedEventCount: Number(ledger[`unpriced${index}`] ?? 0), unknownBrowserRunCount: Number(browser[`unknown${index}`] ?? 0), recoveringRunCount: Number(runs[`recovering${index}`] ?? 0) };
   });
 }
 

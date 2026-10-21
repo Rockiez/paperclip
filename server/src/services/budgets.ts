@@ -178,9 +178,14 @@ export function budgetPoliciesForRun(companyId: string, agentId: string | null, 
   );
 }
 
+function unpricedUsageBlocks(policy: PolicyRow, observed: ObservedSpend) {
+  return policy.unpricedUsagePolicy !== "allow"
+    && (observed.unpricedEventCount > 0 || observed.unknownBrowserRunCount > 0);
+}
+
 function observedBlocks(policy: PolicyRow, observed: Awaited<ReturnType<typeof computeObservedSpend>>) {
   if (!policy.isActive || !policy.hardStopEnabled || policy.amount <= 0) return false;
-  return compareCents(observed.totalExact, policy.amount) >= 0 || (observed.pendingRunCount - observed.recoveringRunCount) > 0 || (policy.unpricedUsagePolicy !== "allow" && observed.unpricedEventCount > 0);
+  return compareCents(observed.totalExact, policy.amount) >= 0 || (observed.pendingRunCount - observed.recoveringRunCount) > 0 || unpricedUsageBlocks(policy, observed);
 }
 export async function policyBlocks(db: Db, policy: PolicyRow) {
   if (!policy.isActive || !policy.hardStopEnabled || policy.amount <= 0) return false;
@@ -553,7 +558,7 @@ export function budgetServiceInTransaction(db: Db, publications: ActivityPublica
         if (observed.pendingRunCount > 0) {
           return { scopeType, scopeId, scopeName: scope.name, reason: `${title} cannot start work while completed runs await accounting.` };
         }
-        if (policy.unpricedUsagePolicy !== "allow" && observed.unpricedEventCount > 0) {
+        if (unpricedUsageBlocks(policy, observed)) {
           return { scopeType, scopeId, scopeName: scope.name, reason: `${title} cannot start work because recorded usage has no reliable price.` };
         }
         return { scopeType, scopeId, scopeName: scope.name, reason: scopeType === "project"
@@ -878,7 +883,7 @@ export function budgetServiceInTransaction(db: Db, publications: ActivityPublica
       if (input.action === "raise_budget_and_resume") {
         const nextAmount = Math.max(0, Math.floor(input.amount ?? 0));
         const observed = await computeObservedSpend(db, policy);
-        if (policy.unpricedUsagePolicy !== "allow" && observed.unpricedEventCount > 0) {
+        if (unpricedUsageBlocks(policy, observed)) {
           throw unprocessable("Resolve unpriced usage or explicitly allow it in the budget policy before resuming");
         }
         if (observed.pendingRunCount > 0) throw unprocessable("Completed runs must finish accounting before resuming");
