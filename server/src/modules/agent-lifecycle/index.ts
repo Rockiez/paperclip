@@ -38,6 +38,12 @@ export function scheduleAgentLifecycle(db: Db, id: string) {
   return workers.get(db)?.process(id).catch(() => {});
 }
 
+/** Destructive deletion must establish this agent's completed cleanup before
+ * purging dependent records. Ordinary producers only schedule asynchronous work. */
+export function processAgentLifecycle(db: Db, id: string): Promise<void> {
+  return workers.get(db)?.process(id) ?? Promise.resolve();
+}
+
 export function createAgentLifecycle(db: Db, effects: LifecycleEffects) {
   assertRootDatabase(db);
   const records = agentRecords(db, effects);

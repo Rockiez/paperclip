@@ -19,7 +19,7 @@ import { and, eq, sql } from "drizzle-orm";
 import { agents, approvals, projects, issues, heartbeatRuns, nativeRunFinalizations, budgetPolicies, environmentLeases, agentApiKeys, activityLog, agentConfigRevisions, userCompanyPreferences, companies, companyMemberships, principalPermissionGrants, plugins, pluginCompanySettings, createDb, type Db } from "@paperclipai/db";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../../__tests__/helpers/embedded-postgres.js";
-import { createAgentLifecycle, configureAgentLifecycle } from "../../../services/agent-lifecycle.js";
+import { createAgentLifecycle, configureAgentLifecycle, startAgentLifecycle } from "../../../services/agent-lifecycle.js";
 import { projectCompanyHolds } from "../adapters/company-policy.js";
 import { createLifecycleStore as createStore } from "../adapters/postgres.js";
 import { transition } from "../domain/policy.js";
@@ -393,6 +393,25 @@ const support = await getEmbeddedPostgresTestSupport();
     await deleteCompany(db, companyId);
     expect(await db.select().from(agents).where(eq(agents.companyId, companyId))).toHaveLength(0);
     expect(await db.select().from(companies).where(eq(companies.id, companyId))).toHaveLength(0);
+  });
+
+  it("awaits only the deleted company's agents when a coordinator owns lifecycle wakeups", async () => {
+    const agent = await hire();
+    const [otherCompany] = await db.insert(companies).values({ name: "Unaffected", issuePrefix: `U${companyId.slice(0, 7)}` }).returning();
+    const [otherAgent] = await db.insert(agents).values({ companyId: otherCompany.id, name: "Pending elsewhere",
+      lifecycleState: "preparing", lifecycleOperation: { id: randomUUID(), hostComplete: false, completedPluginIds: [], attempts: 0 } }).returning();
+    const phases: string[] = [];
+    const work = startAgentLifecycle(db, { requiredPluginIds: async () => [], runPlugin: async () => "complete",
+      runHost: async snapshot => { expect(snapshot.id).toBe(agent.id); phases.push(snapshot.lifecycleState); return "complete"; } }, () => true);
+    const wake = vi.fn();
+    work.setWake(wake);
+    try {
+      await deleteCompany(db, companyId);
+      expect(phases).toEqual(["terminating", "cleaning_up"]);
+      expect(wake).toHaveBeenCalled();
+      expect(await db.select().from(companies).where(eq(companies.id, companyId))).toHaveLength(0);
+      expect((await current(otherAgent.id)).lifecycleState).toBe("preparing");
+    } finally { await work.stop(); }
   });
 
   it("requires a transaction for the company deletion integration", async () => {

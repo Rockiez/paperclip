@@ -13,7 +13,7 @@ import { fenceActiveCompanyAgentStopsInTransaction as fenceActiveCompanyStops } 
 import { applyAgentPolicyHoldsInTransaction } from "../modules/agent-lifecycle/index.js";
 import { trackIdleWork } from "./task-admission.js";
 
-export { scheduleAgentLifecycle } from "../modules/agent-lifecycle/index.js";
+export { scheduleAgentLifecycle, processAgentLifecycle } from "../modules/agent-lifecycle/index.js";
 export type { LifecycleDriver, LifecycleAgent } from "../modules/agent-lifecycle/index.js";
 
 export function createAgentLifecycleEffects(_hooks: BudgetServiceHooks = {}): lifecycle.LifecycleEffects {
