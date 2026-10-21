@@ -241,9 +241,15 @@ export async function resumeNativeWorkspaceFinalization(input: {
           return workspaceSyncFailure(code);
         }
       }
-      const pluginWorkspace = workspace
-        ? await inspectPluginWorkspaceForFinalization(input.db, input.pluginWorkerManager, workspace, bound.agentId)
-        : null;
+      let pluginWorkspace: Record<string, unknown> | null;
+      try {
+        pluginWorkspace = workspace
+          ? await inspectPluginWorkspaceForFinalization(input.db, input.pluginWorkerManager, workspace, bound.agentId)
+          : null;
+      } catch {
+        await ownership.assertHeld();
+        return { status: "failed", exitCode: 1, stderr: "plugin_workspace_inspection_failed\n" };
+      }
       await ownership.assertHeld();
       if (pluginWorkspace) return { status: "succeeded", exitCode: 0,
         system: "Native workspace finalization used the plugin workspace owner.\n",

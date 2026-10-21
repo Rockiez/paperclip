@@ -99,6 +99,7 @@ Return `sessionStateAvailable: true` only when the suspended state remains usabl
 Keep retained state when Core completes the task.
 Core checks managed plugin workspaces through their storage provider before
 completion, including after a restart. Core does not inspect these folders locally.
+If this check fails, Core defers the run and continues recovery for other runs.
 
 The task contract exposes two checkpoint operations:
 

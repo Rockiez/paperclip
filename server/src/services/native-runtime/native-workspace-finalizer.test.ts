@@ -740,6 +740,27 @@ describe("native workspace finalization recovery", () => {
     } finally { inspect.mockRestore(); }
   });
 
+  it("defers an unavailable workspace plugin without aborting other result recovery", async () => {
+    const [unavailable, healthy] = await db.insert(executionWorkspaces).values([
+      { companyId, projectId, name: "Unavailable plugin", providerType: "plugin", providerRef: "provider:unavailable",
+        mode: "isolated_workspace", strategyType: "git_worktree", branchName: "task-branch" },
+      { companyId, projectId, name: "Healthy task", providerType: "adapter_managed", cwd: "/workspaces/healthy-task",
+        mode: "shared_workspace", strategyType: "project_primary", metadata: { runnerTaskWorkspaceOwner: { agentId } } },
+    ]).returning();
+    const blocked = await seedRun({ executionWorkspaceId: unavailable.id, title: "Plugin is unavailable after restart" });
+    const ready = await seedRun({ executionWorkspaceId: healthy.id, title: "Other result can recover" });
+    const inspect = vi.spyOn(pluginWorkspaces, "inspectPluginWorkspace").mockRejectedValue(new Error("synthetic plugin unavailable"));
+    try {
+      await expect(reconcileNativeFinalizations(db, [blocked.runId, ready.runId])).resolves.toBeDefined();
+      const [retry] = await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, blocked.runId));
+      expect(retry).toMatchObject({ phase: "retryable_failure", nextAttemptAt: expect.any(Date), resultId: expect.any(String) });
+      expect(await db.select().from(workspaceOperations).where(eq(workspaceOperations.heartbeatRunId, blocked.runId)))
+        .toMatchObject([{ status: "failed", stderrExcerpt: "plugin_workspace_inspection_failed\n" }]);
+      expect(await db.select().from(workspaceOperations).where(eq(workspaceOperations.heartbeatRunId, ready.runId)))
+        .toMatchObject([{ status: "succeeded" }]);
+    } finally { inspect.mockRestore(); }
+  });
+
   it("records directory-only recovery without inventing an execution-workspace foreign key", async () => {
     const cwd = path.join(workspaceRoot, "directory-only");
     await fs.mkdir(cwd);
