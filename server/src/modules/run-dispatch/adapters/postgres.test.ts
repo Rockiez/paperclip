@@ -4,7 +4,11 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 import {
   activityLog,
   agents,
+  approvals,
+  budgetIncidents,
+  budgetPolicies,
   companies,
+  costEvents,
   createDb,
   documentRevisions,
   documents,
@@ -25,6 +29,9 @@ import {
 import { createPostgresRunDispatchAdapter } from "./postgres.js";
 import { settleUnrecoverableExecutions } from "../../../services/execution-recovery-resolution.js";
 import { getExecutionBlocker } from "../../../services/execution-blocker.js";
+import { reserveRunBudget } from "../../../services/budget-reservations.js";
+import { budgetService } from "../../../services/budgets.js";
+import { costService } from "../../../services/costs.js";
 
 // Proves the DB-to-facts mapping this adapter owns for each state the two
 // run-dispatch gates decide on. `application/use-cases.test.ts` and
@@ -52,6 +59,10 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
   }, 20_000);
 
   afterEach(async () => {
+    await db.delete(budgetIncidents);
+    await db.delete(approvals);
+    await db.delete(budgetPolicies);
+    await db.delete(costEvents);
     await db.delete(environmentLeases);
     await db.delete(activityLog);
     await db.delete(issueDocuments);
@@ -317,6 +328,7 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
     expect(await adapter.evaluateScheduledRetryGate({ companyId, runId: replacementId, retryReasonOverride: retryReason, now: new Date() }))
       .toMatchObject({ allowed: false, errorCode: "issue_execution_lock_changed" });
     await db.update(heartbeatRuns).set({ status: "queued" }).where(eq(heartbeatRuns.id, replacementId));
+    const reservation = await reserveRunBudget(db, companyId, replacementId, null);
     expect(await adapter.cancelStaleQueuedRun({ companyId, runId: replacementId, expectedStatus: "queued", now: new Date() }))
       .toMatchObject({ outcome: "cancelled", errorCode: "issue_execution_lock_changed" });
 
@@ -325,7 +337,7 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
     await db.update(heartbeatRuns).set({ status: "running" }).where(eq(heartbeatRuns.id, replacementId));
     let dispatched = false;
     const outcome = await adapter.dispatchResolvedInteractionIfCurrent({ companyId, runId: replacementId,
-      expectedStatus: "running", now: new Date(), dispatch: async () => { dispatched = true; } });
+      reservationId: reservation.id, expectedStatus: "running", now: new Date(), dispatch: async () => { dispatched = true; } });
     expect(outcome).toMatchObject({ dispatched: false, cancellation: { outcome: "cancelled" } });
     expect(dispatched).toBe(false);
     expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]![lock]).toBe(competingId);
@@ -343,11 +355,12 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
     expect(await adapter.evaluateScheduledRetryGate({ companyId, runId: replacementId, retryReasonOverride: retryReason, now: new Date() }))
       .toMatchObject({ allowed: false, errorCode: "issue_blocked" });
     await db.update(heartbeatRuns).set({ status: "queued" }).where(eq(heartbeatRuns.id, replacementId));
+    const reservation = await reserveRunBudget(db, companyId, replacementId, null);
     expect(await adapter.cancelStaleQueuedRun({ companyId, runId: replacementId, expectedStatus: "queued", now: new Date() }))
       .toMatchObject({ outcome: "cancelled", errorCode: "issue_blocked" });
     await db.update(heartbeatRuns).set({ status: "running" }).where(eq(heartbeatRuns.id, replacementId));
     const dispatch = vi.fn(async () => undefined);
-    expect(await adapter.dispatchResolvedInteractionIfCurrent({ companyId, runId: replacementId, expectedStatus: "running", now: new Date(), dispatch }))
+    expect(await adapter.dispatchResolvedInteractionIfCurrent({ companyId, runId: replacementId, reservationId: reservation.id, expectedStatus: "running", now: new Date(), dispatch }))
       .toMatchObject({ dispatched: false, cancellation: { outcome: "cancelled" } });
     expect(dispatch).not.toHaveBeenCalled();
     expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]!.status).toBe("blocked");
@@ -373,7 +386,8 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
       if (mode === "resolved") await db.update(issues).set({ status: "done" }).where(eq(issues.id, blockerId));
       await db.update(issues).set({ executionRunId: replacementId }).where(eq(issues.id, issueId));
       await db.update(heartbeatRuns).set({ status: "running" }).where(eq(heartbeatRuns.id, replacementId));
-      const result = await adapter.dispatchResolvedInteractionIfCurrent({ companyId, runId: replacementId, expectedStatus: "running", now: new Date(), dispatch });
+      const reservation = await reserveRunBudget(db, companyId, replacementId, null);
+      const result = await adapter.dispatchResolvedInteractionIfCurrent({ companyId, runId: replacementId, reservationId: reservation.id, expectedStatus: "running", now: new Date(), dispatch });
       expect(result).toMatchObject(mode === "resolved" ? { dispatched: true } : {
         dispatched: false, cancellation: { outcome: "cancelled", errorCode: "issue_dependencies_blocked" },
       });
@@ -389,8 +403,9 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
     const runId = await seedRun({ companyId, agentId, status: "running", contextSnapshot: { issueId } });
     await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, issueId));
     const adapter = createPostgresRunDispatchAdapter(db);
+    const reservation = await reserveRunBudget(db, companyId, runId, null);
     const gate = await adapter.dispatchResolvedInteractionIfCurrent({
-      companyId, runId, expectedStatus: "running", now: new Date(),
+      companyId, runId, reservationId: reservation.id, expectedStatus: "running", now: new Date(),
       dispatch: async () => {
         // The incident's third attempt failed here before onSpawn. A held
         // admission lock makes this finalization fail with lock_timeout.
@@ -414,6 +429,7 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
     const runId = await seedRun({ companyId, agentId, status: "running", contextSnapshot: { issueId } });
     const competingId = await seedRun({ companyId, agentId, status: "running", contextSnapshot: { issueId } });
     await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, issueId));
+    const reservation = await reserveRunBudget(db, companyId, runId, null);
     const transaction = db.transaction.bind(db);
     const ordering: string[] = [];
     // Inject a competing claim immediately after commit, before control returns
@@ -426,7 +442,7 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
     });
     try {
       const gate = await createPostgresRunDispatchAdapter(db).dispatchResolvedInteractionIfCurrent({
-        companyId, runId, expectedStatus: "running", now: new Date(),
+        companyId, runId, reservationId: reservation.id, expectedStatus: "running", now: new Date(),
         dispatch: async () => { ordering.push("handoff"); return "started"; },
       });
       expect(gate.dispatched).toBe(true);
@@ -435,6 +451,87 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
     } finally {
       transactionSpy.mockRestore();
     }
+  });
+
+  it.each(["charge", "budget reduction"] as const)("rechecks a late %s after ordinary run preparation before any provider handoff", async change => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const runId = await seedRun({ companyId, agentId, status: "running" });
+    const budgets = budgetService(db);
+    await budgets.upsertPolicy(companyId, { scopeType: "company", scopeId: companyId,
+      metric: "billed_cents", windowKind: "lifetime", amount: 100, reservationCents: "60", notifyEnabled: false }, null);
+    const reservation = await reserveRunBudget(db, companyId, runId, null);
+    let finishPreparation!: () => void;
+    const preparation = new Promise<void>(resolve => { finishPreparation = resolve; });
+    const dispatch = vi.fn(async () => "provider started");
+    const preparedDispatch = preparation.then(() => createPostgresRunDispatchAdapter(db).dispatchResolvedInteractionIfCurrent({
+      companyId, runId, reservationId: reservation.id, expectedStatus: "running", now: new Date(), dispatch,
+    }));
+    try {
+      if (change === "charge") await costService(db).createEvent(companyId, {
+        agentId, provider: "test", model: "dispatch-race", costCents: 50,
+        inputTokens: 1, outputTokens: 1, occurredAt: new Date(),
+      });
+      else await budgets.upsertPolicy(companyId, { scopeType: "company", scopeId: companyId,
+        metric: "billed_cents", windowKind: "lifetime", amount: 50 }, null);
+      finishPreparation();
+      expect(await preparedDispatch).toMatchObject({ dispatched: false,
+        admissionBlockReason: "Available budget is reserved by unfinished runs" });
+      expect(dispatch).not.toHaveBeenCalled();
+    } finally { finishPreparation(); await preparedDispatch; }
+  });
+
+  it("does not count its own existing reservation twice at final handoff", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const runId = await seedRun({ companyId, agentId, status: "running" });
+    await budgetService(db).upsertPolicy(companyId, { scopeType: "company", scopeId: companyId,
+      metric: "billed_cents", windowKind: "lifetime", amount: 100, reservationCents: "100", notifyEnabled: false }, null);
+    const reservation = await reserveRunBudget(db, companyId, runId, null);
+    const dispatch = vi.fn(async () => "started");
+    const gate = await createPostgresRunDispatchAdapter(db).dispatchResolvedInteractionIfCurrent({
+      companyId, runId, reservationId: reservation.id, expectedStatus: "running", now: new Date(), dispatch,
+    });
+    expect(gate.dispatched).toBe(true);
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    if (gate.dispatched) expect(await gate.resultPromise).toBe("started");
+  });
+
+  it("does not dispatch a zero reservation once other work has fully reserved capacity", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const runId = await seedRun({ companyId, agentId, status: "running" });
+    const budgets = budgetService(db);
+    await budgets.upsertPolicy(companyId, { scopeType: "company", scopeId: companyId,
+      metric: "billed_cents", windowKind: "lifetime", amount: 100, reservationCents: "0", notifyEnabled: false }, null);
+    const reservation = await reserveRunBudget(db, companyId, runId, null);
+    await budgets.upsertPolicy(companyId, { scopeType: "company", scopeId: companyId,
+      metric: "billed_cents", windowKind: "lifetime", reservationCents: "100" }, null);
+    const otherRunId = await seedRun({ companyId, agentId, status: "running" });
+    await reserveRunBudget(db, companyId, otherRunId, null);
+    const dispatch = vi.fn(async () => undefined);
+    expect(await createPostgresRunDispatchAdapter(db).dispatchResolvedInteractionIfCurrent({
+      companyId, runId, reservationId: reservation.id, expectedStatus: "running", now: new Date(), dispatch,
+    })).toMatchObject({ dispatched: false, admissionBlockReason: "Available budget is reserved by unfinished runs" });
+    expect(dispatch).not.toHaveBeenCalled();
+  });
+
+  it("commits a discovered budget stop even when final handoff is denied", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const runId = await seedRun({ companyId, agentId, status: "running" });
+    await budgetService(db).upsertPolicy(companyId, { scopeType: "company", scopeId: companyId,
+      metric: "billed_cents", windowKind: "lifetime", amount: 100, notifyEnabled: false }, null);
+    const reservation = await reserveRunBudget(db, companyId, runId, null);
+    // Seed committed historical spend whose lifecycle projection has not yet
+    // been repaired. The gate must persist that repair rather than roll it back.
+    await db.insert(costEvents).values({ companyId, agentId, provider: "test", model: "unprojected-charge",
+      inputTokens: 1, outputTokens: 1, costCents: 110, occurredAt: new Date() });
+    const dispatch = vi.fn(async () => undefined);
+    expect(await createPostgresRunDispatchAdapter(db).dispatchResolvedInteractionIfCurrent({
+      companyId, runId, reservationId: reservation.id, expectedStatus: "running", now: new Date(), dispatch,
+    })).toMatchObject({ dispatched: false, admissionBlockReason: expect.any(String) });
+    expect(dispatch).not.toHaveBeenCalled();
+    expect((await db.select().from(companies).where(eq(companies.id, companyId)))[0])
+      .toMatchObject({ status: "paused", pauseReason: "budget" });
+    const [policy] = await db.select().from(budgetPolicies).where(eq(budgetPolicies.companyId, companyId));
+    expect(policy.enforcementVersion).toBeGreaterThan(policy.enforcementDeliveredVersion);
   });
 
   async function waitForBlockedForUpdate(tableName: string) {

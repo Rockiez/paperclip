@@ -330,7 +330,7 @@ import {
   projects,
   projectWorkspaces,
 } from "@paperclipai/db";
-import { HttpError, notFound } from "../errors.js";
+import { conflict, HttpError, notFound } from "../errors.js";
 
 import { logger } from "../middleware/logger.js";
 import { publishLiveEvent } from "./live-events.js";
@@ -2748,12 +2748,13 @@ export function heartbeatService(
       }
       const dispatchResolvedInteractionContinuationAfterAdmission = async <T>(
         dispatch: (markDispatchStarted: () => void) => Promise<T>,
+        reservation: { id: string; reused: boolean },
       ): Promise<
         { dispatched: true; resultPromise: Promise<T> } | { dispatched: false }
       > => {
         await controllerLease.assertOwned("dispatching");
-        // Recheck after workspace/credential preparation, immediately before the
-        // provider handoff. Never hold validation locks while adapter code runs.
+        // Recheck after preparation. The final locked gate protects synchronous
+        // handoff and commits before waiting for adapter bootstrap or execution.
         await authorizeFailedChatRetryExecution();
         if (
           !(await withChatControlRecoveryGate(
@@ -2779,33 +2780,25 @@ export function heartbeatService(
           }
           return { dispatched: false };
         }
-        if (
-          !issueId ||
-          (!isResolvedInteractionContinuationWakeContext(context) &&
-            typeof context.workspaceReconstructionActionId !== "string" &&
-            !["native_safe_replacement", "native_provider_overloaded"].includes(run.scheduledRetryReason ?? ""))
-        ) {
-          return { dispatched: true, resultPromise: dispatch(() => {}) };
+        if (issueId && (isResolvedInteractionContinuationWakeContext(context) ||
+          typeof context.workspaceReconstructionActionId === "string" ||
+          ["native_safe_replacement", "native_provider_overloaded"].includes(run.scheduledRetryReason ?? ""))) {
+          await options.beforeResolvedInteractionContinuationDispatchCheck?.({ runId: run.id, issueId });
+          await options.afterResolvedInteractionContinuationDispatchCheck?.({ runId: run.id, issueId });
         }
-        await options.beforeResolvedInteractionContinuationDispatchCheck?.({
-          runId: run.id,
-          issueId,
-        });
-
-        await options.afterResolvedInteractionContinuationDispatchCheck?.({
-          runId: run.id,
-          issueId,
-        });
         const gate = await runDispatch.dispatchResolvedInteractionIfCurrent({
           runId: run.id,
           companyId: run.companyId,
           expectedStatus: "running",
+          reservationId: reservation.id,
+          ...(reservation.reused ? { recoveryLeaseOwner: runOptions.nativeLeaseOwner } : {}),
           // Synchronous handoff under the ownership lock; the gate commits
           // without awaiting the adapter's asynchronous bootstrap or finalizer.
           dispatch,
         });
 
         if (gate.dispatched) return gate;
+        if ("admissionBlockReason" in gate) throw conflict(gate.admissionBlockReason);
         if (gate.cancellation.outcome === "cancelled") {
           applyRunDispatchPostCommitEffects(
             gate.cancellation.postCommitEffects,
@@ -2826,7 +2819,7 @@ export function heartbeatService(
           return await dispatchResolvedInteractionContinuationAfterAdmission((markDispatchStarted) => {
             entered = true;
             return dispatch(markDispatchStarted);
-          });
+          }, reservation);
         } finally {
           if (!entered && !reservation.reused) {
             await db.update(heartbeatRuns).set({ costAccountingPending: true,

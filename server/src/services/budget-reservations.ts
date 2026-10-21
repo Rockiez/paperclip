@@ -5,6 +5,53 @@ import { conflict, notFound } from "../errors.js";
 import { withAccountingTransaction } from "./accounting-transaction.js";
 import { budgetServiceInTransaction } from "./budgets.js";
 import { withBudgetSpan } from "./budget-tracing.js";
+import type { ActivityPublication } from "./activity-log.js";
+
+/** Called by the final dispatch gate with the company and run already locked.
+ * Admission may have waited through preparation; that earlier reservation is
+ * evidence of ownership, not permission to bypass a newer charge or pause. */
+export async function recheckRunBudgetReservationInTransaction(
+  tx: Db,
+  publications: ActivityPublication[],
+  run: typeof heartbeatRuns.$inferSelect,
+  reservationId: string,
+  recoveryLeaseOwner?: string,
+): Promise<string | null> {
+  if (run.resultJson?.cancellation || run.resultJson?.startupCancellation)
+    return "Run cancellation already requested";
+  if (run.costAccountedAt || !["queued", "running"].includes(run.status))
+    return "Run can no longer start provider work";
+  const [reservation] = await tx.select().from(budgetReservations).where(and(
+    eq(budgetReservations.id, reservationId), eq(budgetReservations.companyId, run.companyId),
+    eq(budgetReservations.runId, run.id), eq(budgetReservations.agentId, run.agentId),
+    eq(budgetReservations.state, "held"),
+  )).for("update");
+  if (!reservation) return "Provider dispatch no longer owns a held budget reservation";
+  if (recoveryLeaseOwner) {
+    const [owner] = run.runtimeMode === "native" ? await tx.select({ runId: nativeRunFinalizations.runId })
+      .from(nativeRunFinalizations).where(and(eq(nativeRunFinalizations.companyId, run.companyId),
+        eq(nativeRunFinalizations.runId, run.id), eq(nativeRunFinalizations.leaseOwner, recoveryLeaseOwner),
+        sql`${nativeRunFinalizations.leaseExpiresAt} > now()`)).for("update") : [];
+    if (!owner) return "Native recovery no longer owns provider dispatch";
+  }
+  const { block, policies, observations } = await budgetServiceInTransaction(tx, publications)
+    .evaluateAdmission(run.companyId, run.agentId, { projectId: reservation.projectId });
+  if (block) return block.reason;
+  const [agent] = await tx.select({ status: agents.status, lifecycleState: agents.lifecycleState }).from(agents)
+    .where(and(eq(agents.companyId, run.companyId), eq(agents.id, run.agentId)));
+  if (!agent || agent.lifecycleState !== "ready" || ["paused", "terminated", "pending_approval"].includes(agent.status))
+    return "Agent is paused or its lifecycle is not ready for new work";
+  for (const [index, policy] of policies.entries()) {
+    const observed = observations[index];
+    // This operation's hold is already included in exposure. Do not propose it
+    // twice, or reject a nonzero reservation that exactly fills the budget.
+    const committed = centsToUnits(observed.ledgerCents) + centsToUnits(observed.effectiveHeldCents);
+    const limit = centsToUnits(policy.amount);
+    if (committed > limit || (centsToUnits(reservation.amountCents) === 0n && committed >= limit))
+      return "Available budget is reserved by unfinished runs";
+  }
+  return null;
+}
 
 /** Reserve before dispatch, under the same company lock as charges and policy
  * changes. Estimates constrain admission; they cannot cap a provider's bill.

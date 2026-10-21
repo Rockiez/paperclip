@@ -161,6 +161,7 @@ describe("createDispatchResolvedInteractionIfCurrent", () => {
       runId: "run-1",
       companyId: "company-1",
       expectedStatus: "running",
+      reservationId: "reservation-1",
       dispatch,
     });
 

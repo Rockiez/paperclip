@@ -19,6 +19,7 @@ import type { ActivityPublication } from "../../../services/activity-log.js";
 import { parseObject } from "../../../adapters/utils.js";
 import { evaluateAgentInvokabilityFromDb } from "../../../services/agent-invokability.js";
 import { budgetService, budgetServiceInTransaction } from "../../../services/budgets.js";
+import { recheckRunBudgetReservationInTransaction } from "../../../services/budget-reservations.js";
 import { isCompletedOnboardingHandoffWake } from "../../../services/chat-completion-delivery.js";
 import { isHeartbeatWakeOnDemandEnabled } from "../../../services/heartbeat-policy.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "../../../services/delivery-work-notifications.js";
@@ -1176,6 +1177,13 @@ export function createPostgresRunDispatchAdapter(
         );
         return { dispatched: false as const, cancellation };
       }
+
+      const admissionBlockReason = await recheckRunBudgetReservationInTransaction(
+        tx, publications, run, input.reservationId, input.recoveryLeaseOwner,
+      );
+      // Commit budget-owned hold/enforcement changes before the caller handles
+      // denial. Throwing here would roll back the very stop intent we found.
+      if (admissionBlockReason) return { dispatched: false as const, admissionBlockReason };
 
       // Hand off while ownership is still locked, but do not await the provider
       // promise. Bootstrap and failure finalization can update these same rows;
