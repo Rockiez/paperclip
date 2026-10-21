@@ -24,9 +24,11 @@ export async function runAutomaticRepositoryFlow(input: {
   const files = automaticRepositoryFiles(nonce);
   let issue: Row | undefined;
   let runs: Row[] = [];
-  const observation: AutomaticRepositoryObservation = { reference: files.reference, issueDone: false, runCount: 0,
+  const observation: AutomaticRepositoryObservation = { reference: "", issueDone: false, runCount: 0,
     successfulCommittedRuns: 0, sourceContinuation: null, successorSource: null, workspaceIds: [], readyRepository: false,
-    savedContext: null, actualReadme: null, actualCommit: null, downloaded: null, downloadVerified: false,
+    savedContext: null, firstSavedContext: null, firstContextAttributed: false,
+    firstContextObservedAt: null, successorStartedAt: null,
+    actualReadme: null, actualCommit: null, downloaded: null, downloadVerified: false,
     visibleDelivery: false, pendingInteractions: -1, monitorScheduled: false };
   async function refresh() {
     if (!issue) return;
@@ -41,6 +43,17 @@ export async function runAutomaticRepositoryFlow(input: {
       run.nativePhase === "committed" && run.resultJson?.finalizationPhase === "committed").length;
     observation.sourceContinuation = runs[0]?.resultJson?.nativeResult?.continuation?.kind ?? null;
     observation.successorSource = runs[1]?.contextSnapshot?.source ?? null;
+    observation.successorStartedAt = runs[1]?.startedAt ? Date.parse(runs[1].startedAt) : null;
+    if (runs.length === 1 && runs[0]?.status === "running" && observation.firstContextObservedAt === null) {
+      // Observe the source artifact while its admission is still running. A
+      // successor-created file must never become the baseline for retention.
+      const original = await readRegisteredArtifacts(api, issue.id, runs[0].id, [files.context]).catch(() => null);
+      if (original?.[0]) {
+        observation.firstSavedContext = original[0].content;
+        observation.firstContextAttributed = original[0].contentVerified;
+        observation.firstContextObservedAt = Date.now();
+      }
+    }
     observation.workspaceIds = runs.map(run => run.runnerProfileJson?.nativeExecutionInput?.binding?.executionWorkspaceId ?? null);
     observation.monitorScheduled ||= Boolean(issue.monitorNextCheckAt || runs.some(run => String(run.resultJson?.finalizationReasonCode).startsWith("scheduled_monitor_")));
   }
@@ -86,6 +99,9 @@ export async function runAutomaticRepositoryFlow(input: {
     observation.actualCommit = (await git(["rev-parse", "HEAD"])).trim();
     observation.actualReadme = await git(["show", "HEAD:README"]);
     observation.readyRepository = repositories[0].pinnedCommit === observation.actualCommit;
+    const [original] = await readRegisteredArtifacts(api, issue.id, runs[0]!.id, [files.context]);
+    observation.firstContextAttributed &&= original.contentVerified && original.content === observation.firstSavedContext;
+    if (/^[a-f0-9]{64}\n$/.test(original.content)) observation.reference = original.content.trimEnd();
     const context = await api.get<Row>(`/api/issues/${issue.id}/file-resources/content?workspace=execution&path=${encodeURIComponent(files.context)}`);
     observation.savedContext = context.resource?.workspaceKind === "execution_workspace" && typeof context.content?.data === "string" ? context.content.data : null;
     const [artifact] = await readRegisteredArtifacts(api, issue.id, runs[1]!.id, [files.result]);

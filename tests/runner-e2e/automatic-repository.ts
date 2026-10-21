@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import type { RunnerTaskFixture } from "./types.js";
 
 export function automaticRepositoryFiles(nonce: string) {
-  return { context: `setup-context-${nonce}.txt`, result: `repository-result-${nonce}.json`, reference: `REFERENCE-${nonce}` };
+  return { context: `setup-context-${nonce}.txt`, result: `repository-result-${nonce}.json` };
 }
 
 export const automaticRepositoryTask: RunnerTaskFixture = {
@@ -17,9 +17,10 @@ export const automaticRepositoryTask: RunnerTaskFixture = {
     const files = automaticRepositoryFiles(nonce);
     return [
       "Verify a repository in this projectless task and deliver the result. Do not create a project or another task.",
-      `Before repository setup, save ${files.context} in the task directory with exactly ${JSON.stringify(`${files.reference}\n`)}. The final newline is an actual LF.`,
+      `Before repository setup, generate a fresh unpredictable 32-byte hexadecimal reference using the operating system random source. Save that reference followed by one LF in ${files.context} in the task directory. Do not include its value in comments or the final answer.`,
+      `Before requesting repository preparation, register ${files.context} as a downloadable artifact with that exact title. This records the first admission's original bytes.`,
       "Use the task's managed repository capability to prepare https://github.com/octocat/Hello-World. Keep the task directory as the root.",
-      "When the checkout is ready, read its committed README and HEAD commit. Read the saved context file again; preserve its original reference.",
+      "When the checkout is ready, read its committed README and HEAD commit. Read the saved context file again; preserve its original reference. If the file is missing or invalid, report the failure and stop. Never recreate, overwrite, or recover it from an attachment or earlier conversation.",
       `Write ${files.result} as JSON with exactly these fields: reference (the saved reference without its trailing LF), readme (the complete committed README bytes as text), and commit (the full HEAD SHA).`,
       `Register ${files.result} as a downloadable artifact work product with that exact title. Deliver its accessible link and finish the verification. Repository setup alone does not complete this request.`,
     ].join("\n");
@@ -37,6 +38,10 @@ export interface AutomaticRepositoryObservation {
   workspaceIds: Array<string | null>;
   readyRepository: boolean;
   savedContext: string | null;
+  firstSavedContext: string | null;
+  firstContextAttributed: boolean;
+  firstContextObservedAt: number | null;
+  successorStartedAt: number | null;
   actualReadme: string | null;
   actualCommit: string | null;
   downloaded: { reference?: unknown; readme?: unknown; commit?: unknown } | null;
@@ -55,7 +60,10 @@ export function gradeAutomaticRepository(value: AutomaticRepositoryObservation) 
       "Repository setup must continue through the saved same-agent wake without a timer or user message."),
     check("retained-workspace", value.workspaceIds.length === 2 && Boolean(value.workspaceIds[0]) && value.workspaceIds.every(id => id === value.workspaceIds[0]) && value.readyRepository,
       "Both admissions must retain the same task workspace and its prepared repository."),
-    check("retained-context", value.savedContext === `${value.reference}\n`, "The original task file must survive setup byte for byte."),
+    check("retained-context", value.firstContextAttributed && value.firstContextObservedAt !== null && value.successorStartedAt !== null &&
+      value.firstContextObservedAt < value.successorStartedAt && /^[a-f0-9]{64}\n$/.test(value.firstSavedContext ?? "") &&
+      value.firstSavedContext === value.savedContext && value.savedContext === `${value.reference}\n`,
+      "The first admission's independently downloaded unpredictable reference must survive setup byte for byte."),
     check("independent-result", value.downloadVerified && value.downloaded !== null &&
       Object.keys(value.downloaded).sort().join(",") === "commit,readme,reference" && value.downloaded.reference === value.reference &&
       typeof value.actualReadme === "string" && value.actualReadme.length > 0 && value.downloaded?.readme === value.actualReadme &&
