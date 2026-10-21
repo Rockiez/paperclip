@@ -246,9 +246,12 @@ export async function resumeNativeWorkspaceFinalization(input: {
         pluginWorkspace = workspace
           ? await inspectPluginWorkspaceForFinalization(input.db, input.pluginWorkerManager, workspace, bound.agentId)
           : null;
-      } catch {
+      } catch (error) {
         await ownership.assertHeld();
-        return { status: "failed", exitCode: 1, stderr: "plugin_workspace_inspection_failed\n" };
+        const message = error instanceof Error ? error.message : null;
+        const code = message === "plugin_workspace_branch_mismatch" || message === "plugin_workspace_owner_mismatch"
+          ? message : "plugin_workspace_inspection_failed";
+        return { status: "failed", exitCode: 1, stderr: `${code}\n` };
       }
       await ownership.assertHeld();
       if (pluginWorkspace) return { status: "succeeded", exitCode: 0,

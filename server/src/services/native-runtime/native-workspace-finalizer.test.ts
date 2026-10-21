@@ -740,7 +740,7 @@ describe("native workspace finalization recovery", () => {
     } finally { inspect.mockRestore(); }
   });
 
-  it("defers an unavailable workspace plugin without aborting other result recovery", async () => {
+  it.each(["synthetic plugin unavailable", "plugin_workspace_branch_mismatch", "plugin_workspace_owner_mismatch"])("defers plugin failure without aborting other result recovery: %s", async message => {
     const [unavailable, healthy] = await db.insert(executionWorkspaces).values([
       { companyId, projectId, name: "Unavailable plugin", providerType: "plugin", providerRef: "provider:unavailable",
         mode: "isolated_workspace", strategyType: "git_worktree", branchName: "task-branch" },
@@ -749,13 +749,16 @@ describe("native workspace finalization recovery", () => {
     ]).returning();
     const blocked = await seedRun({ executionWorkspaceId: unavailable.id, title: "Plugin is unavailable after restart" });
     const ready = await seedRun({ executionWorkspaceId: healthy.id, title: "Other result can recover" });
-    const inspect = vi.spyOn(pluginWorkspaces, "inspectPluginWorkspace").mockRejectedValue(new Error("synthetic plugin unavailable"));
+    const inspect = vi.spyOn(pluginWorkspaces, "inspectPluginWorkspace").mockRejectedValue(new Error(message));
+    const code = message.startsWith("plugin_workspace_") ? message : "plugin_workspace_inspection_failed";
     try {
       await expect(reconcileNativeFinalizations(db, [blocked.runId, ready.runId])).resolves.toBeDefined();
       const [retry] = await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, blocked.runId));
-      expect(retry).toMatchObject({ phase: "retryable_failure", nextAttemptAt: expect.any(Date), resultId: expect.any(String) });
+      expect(retry).toMatchObject({ phase: "retryable_failure", nextAttemptAt: expect.any(Date), resultId: expect.any(String),
+        failureCode: code === message ? `native_${code}` : "native_workspace_sync_out_failed" });
+      if (code === message) expect(retry.failureDetail?.nextAction).toContain("Repair the plugin workspace");
       expect(await db.select().from(workspaceOperations).where(eq(workspaceOperations.heartbeatRunId, blocked.runId)))
-        .toMatchObject([{ status: "failed", stderrExcerpt: "plugin_workspace_inspection_failed\n" }]);
+        .toMatchObject([{ status: "failed", stderrExcerpt: `${code}\n` }]);
       expect(await db.select().from(workspaceOperations).where(eq(workspaceOperations.heartbeatRunId, ready.runId)))
         .toMatchObject([{ status: "succeeded" }]);
     } finally { inspect.mockRestore(); }
