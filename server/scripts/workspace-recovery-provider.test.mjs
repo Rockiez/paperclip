@@ -116,8 +116,8 @@ it.skipIf(!live || Boolean(worker))("preserves provider files across an interrup
       expect(snapshot.id).toBe(snapshotId);
       expect(snapshot.state).toBe("active");
     }
-    sandbox = await daytona.create({ ...(snapshotId ? { snapshot: snapshotId } : { image }), autoStopInterval: 10, autoArchiveInterval: 60,
-      resources: { cpu: 2, memory: 4, disk: 10 }, labels: { purpose: "paperclip-recovery-qualification" } }, { timeout: 300 });
+    sandbox = await daytona.create({ ...(snapshotId ? { snapshot: snapshotId } : { image, resources: { cpu: 2, memory: 4, disk: 10 } }),
+      autoStopInterval: 10, autoArchiveInterval: 60, labels: { purpose: "paperclip-recovery-qualification" } }, { timeout: 300 });
     const remoteCwd = "/tmp/paperclip-recovery-fixture";
     await sandbox.process.executeCommand(`mkdir -p ${remoteCwd}`, undefined, undefined, 30);
     await sandbox.process.createSession("old-agent");
