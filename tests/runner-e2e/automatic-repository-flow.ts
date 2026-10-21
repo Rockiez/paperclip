@@ -6,7 +6,7 @@ import { expect, type Page } from "@playwright/test";
 import { pollUntil, type RunnerApi } from "./api.js";
 import { createTaskThroughUi } from "./user-actions.js";
 import { readRegisteredArtifacts } from "./registered-artifact.js";
-import { automaticRepositoryFiles, gradeAutomaticRepository, type AutomaticRepositoryObservation } from "./automatic-repository.js";
+import { automaticRepositoryFiles, automaticRepositoryStopReason, gradeAutomaticRepository, type AutomaticRepositoryObservation } from "./automatic-repository.js";
 import type { LiveFixtureValues } from "./live-fixtures.js";
 import type { MatrixExecution } from "./types.js";
 
@@ -81,8 +81,7 @@ export async function runAutomaticRepositoryFlow(input: {
     await pollUntil({ label: "repository setup and automatic result delivery", deadlineAt: input.deadlineAt, intervalMs: 750,
       load: async () => { await refresh(); return { issue, runs }; },
       accept: () => observation.issueDone && observation.successfulCommittedRuns === 2,
-      reject: state => state.runs.length > 2 ? "Unexpected extra provider admission" :
-        state.runs.some(run => ["failed", "cancelled", "timed_out"].includes(run.status)) ? "A provider admission failed" : undefined });
+      reject: state => state.issue ? automaticRepositoryStopReason({ status: state.issue.status }, state.runs.map(run => ({ status: run.status }))) : undefined });
     const view = await api.get<Row>(`/api/issues/${issue.id}/workspace`);
     const cwd = await realpath(view.workspace.cwd), isolated = await realpath(input.temporaryRoot);
     if (!cwd.startsWith(`${isolated}${path.sep}`) || !cwd.endsWith(`/isolated-workspaces/${fixtures.company.id}/${issue.id}`))

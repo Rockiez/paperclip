@@ -1,5 +1,5 @@
 import { expect, it } from "vitest";
-import { gradeAutomaticRepository, type AutomaticRepositoryObservation } from "./automatic-repository.js";
+import { automaticRepositoryStopReason, gradeAutomaticRepository, type AutomaticRepositoryObservation } from "./automatic-repository.js";
 
 const sha = "a".repeat(40);
 const reference = "c".repeat(64);
@@ -13,6 +13,17 @@ const valid: AutomaticRepositoryObservation = { reference, issueDone: true, runC
 
 it("accepts independent checkout, retained context, and accessible registered output", () => {
   expect(gradeAutomaticRepository(valid).every(check => check.passed)).toBe(true);
+});
+
+it("reports a committed setup blocker immediately instead of waiting out the attempt deadline", () => {
+  expect(automaticRepositoryStopReason({ status: "blocked" }, [{ status: "succeeded" }])).toContain("stopped in blocked");
+  expect(automaticRepositoryStopReason({ status: "done" }, [{ status: "succeeded" }])).toContain("without its automatic successor");
+});
+
+it("keeps waiting for an ordinary queued successor and accepts two completed admissions", () => {
+  expect(automaticRepositoryStopReason({ status: "in_progress" }, [{ status: "succeeded" }])).toBeUndefined();
+  expect(automaticRepositoryStopReason({ status: "in_progress" }, [{ status: "succeeded" }, { status: "queued" }])).toBeUndefined();
+  expect(automaticRepositoryStopReason({ status: "done" }, [{ status: "succeeded" }, { status: "succeeded" }])).toBeUndefined();
 });
 
 it("rejects unexpected result fields rather than trusting a model's extra claims", () => {

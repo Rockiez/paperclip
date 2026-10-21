@@ -7,7 +7,7 @@ import path from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import { agents, createDb, executionWorkspaceRepositoryRoots, executionWorkspaceRepositoryAccess, executionWorkspaceRepositories, executionWorkspaces,
-  heartbeatRuns, issues, projects, projectWorkspaces, projectAccessMembers, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS } from "@paperclipai/db";
+  heartbeatRuns, issues, projects, projectWorkspaces, projectAccessMembers, companyMemberships, authUsers, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS } from "@paperclipai/db";
 import { executionWorkspaceRepositoryService } from "../services/execution-workspace-repositories.js";
 import { buildNativeExecutionInput } from "../services/native-runtime/native-execution-input.js";
 import { nativeRuntimeContextFixture } from "../services/native-runtime/runtime-context.test-fixture.js";
@@ -334,14 +334,21 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(acquisition.materialize).not.toHaveBeenCalled();
   });
 
-  it.each(["sponsored", "local_board", "routine"] as const)("prepares public Git from an idle workspace for a trusted %s task and reuses verified bytes after trust downgrade", async principal => {
+  it.each(["sponsored", "local_board", "local_board_jwt", "routine"] as const)("prepares public Git from an idle workspace for a trusted %s task and reuses verified bytes after trust downgrade", async principal => {
     const f = await fixture();
     await db.update(executionWorkspaces).set({ status: "idle" }).where(eq(executionWorkspaces.id, f.workspace.id));
-    if (principal === "local_board") await db.update(heartbeatRuns).set({ responsibleUserId: "local-board" }).where(eq(heartbeatRuns.id, f.runId));
+    const localBoard = principal === "local_board" || principal === "local_board_jwt";
+    if (localBoard) await db.update(heartbeatRuns).set({ responsibleUserId: "local-board" }).where(eq(heartbeatRuns.id, f.runId));
+    if (principal === "local_board_jwt") {
+      // The production local-trusted company route records this owner membership.
+      await db.insert(authUsers).values({ id: "local-board", name: "Local Board", email: "local-board@example.invalid",
+        emailVerified: true, createdAt: new Date(), updatedAt: new Date() }).onConflictDoNothing();
+      await db.insert(companyMemberships).values({ companyId: f.companyId, principalType: "user", principalId: "local-board", membershipRole: "owner", status: "active" });
+    }
     const receipt = await f.service.request({ companyId: f.companyId, issueId: f.issueId,
-      actor: principal === "local_board" ? { ...f.actor, onBehalfOfUserId: null } : f.actor,
+      actor: localBoard ? { ...f.actor, onBehalfOfUserId: principal === "local_board_jwt" ? "local-board" : null } : f.actor,
       request: { repository: { kind: "url", url: "https://github.com/public/example" }, requestKey: randomUUID() } });
-    const responsibleUserId = principal === "local_board" ? "local-board" : principal === "routine" ? null : f.userId;
+    const responsibleUserId = localBoard ? "local-board" : principal === "routine" ? null : f.userId;
     await db.update(heartbeatRuns).set({ responsibleUserId }).where(eq(heartbeatRuns.id, f.runId));
     const admission = { ...f.admission, responsibleUserId };
     const source = path.join(root, `${f.issueId}-public-source`);
@@ -381,6 +388,14 @@ const support = await getEmbeddedPostgresTestSupport();
     await rm(prepared.cwd, { recursive: true });
     await expect(f.service.prepareForAdmission(admission)).rejects.toThrow(/trusted task|Selected workspace source trust/);
     expect(acquisition.materialize).not.toHaveBeenCalled();
+  });
+
+  it.each(["local-board", null, "changed-human"])("rejects the former sponsor after responsibility changes to %s", async responsibleUserId => {
+    const f = await fixture();
+    await db.update(heartbeatRuns).set({ responsibleUserId }).where(eq(heartbeatRuns.id, f.runId));
+    await expect(f.request({ kind: "url", url: "https://github.com/public/example" })).rejects.toThrow(
+      responsibleUserId === null ? "Repository access requires a responsible user" : "Task workspace responsible user changed");
+    expect(await f.service.list(f.companyId, f.workspace.id)).toEqual([]);
   });
 
   it("reauthorizes a public clone before publication after trust changes during Git", async () => {

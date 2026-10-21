@@ -51,6 +51,15 @@ export interface AutomaticRepositoryObservation {
   monitorScheduled: boolean;
 }
 
+export function automaticRepositoryStopReason(issue: { status: string }, runs: readonly { status: string }[]) {
+  if (runs.length > 2) return "Unexpected extra provider admission";
+  if (runs.some(run => ["failed", "cancelled", "timed_out"].includes(run.status))) return "A provider admission failed";
+  if (runs.length && runs.every(run => run.status === "succeeded")) {
+    if (["blocked", "in_review", "cancelled"].includes(issue.status)) return `Repository setup stopped in ${issue.status}; see retained task state`;
+    if (issue.status === "done" && runs.length !== 2) return "Task finished without its automatic successor";
+  }
+}
+
 export function gradeAutomaticRepository(value: AutomaticRepositoryObservation) {
   const check = (id: string, passed: boolean, detail: string) => ({ id, passed, detail });
   return [

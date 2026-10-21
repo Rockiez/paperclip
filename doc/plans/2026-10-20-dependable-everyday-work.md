@@ -70,3 +70,12 @@ Server typecheck passes. These results include long conversation lineages,
 cycles, broken ledger receipts, current-task repository ownership, and completed
 repository rejection. Explicit completion and review modes remain distinct from
 an unfinished standard-task yield. They do not establish the live matrix.
+
+A fresh local provider pilot exposed a separate repository authorization defect:
+the native API retained the local-board identity while the workspace fence
+expected its older null representation. A native-tool/HTTP/PostgreSQL regression
+reproduces the rejection before the fix. The repaired authorization cohort passes
+78 checks, including revoked membership, changed sponsor, and restricted child
+workspace cases. A committed setup blocker now ends the E2E attempt immediately
+instead of consuming its remaining deadline. The failed pilot remains evidence;
+these regressions do not replace a fresh provider run.
