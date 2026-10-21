@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
 import type { Db } from "@paperclipai/db";
-import { activityLog, agents, agentWakeupRequests, budgetPolicies, caseEvents, caseHandoffs, cases, companies, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, environmentLeases, heartbeatRuns, issues, nativeRunFinalizations, projects } from "@paperclipai/db";
+import { activityLog, agents, agentWakeupRequests, browserUseRuns, browserUseSessions, budgetPolicies, caseEvents, caseHandoffs, cases, companies, connectionGrants, costEvents, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, environmentLeases, heartbeatRuns, issues, nativeRunFinalizations, projects, toolApplications, toolConnections } from "@paperclipai/db";
 import { eq, inArray, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
@@ -28,6 +30,8 @@ import { issueService } from "../issues.js";
 import { persistUsageReceipt } from "../usage-receipts.js";
 import { registerBudgetEnforcementWork } from "../budget-enforcement-worker.js";
 import { createDeliveryWorkCoordinator } from "../delivery-work-coordinator.js";
+import { DELIVERY_QUEUES, subscribeDeliveryWork } from "../delivery-work-notifications.js";
+import { PROCESS_START_REQUESTED } from "../native-local-process-stop.js";
 
 vi.mock("../live-events.js", () => ({ publishLiveEvent: vi.fn() }));
 vi.mock("../adapter-execution-control.js", async (importOriginal) => {
@@ -995,6 +999,65 @@ describe.skipIf(!support.supported)("heartbeat run-control database wiring", () 
     expect(await listPendingBudgetCancellationScopes(db)).toEqual([]);
   });
 
+  it.each(["local exit", "remote receipt", "unproven", "later launch"] as const)("reconciles normal completion before queued budget Stop using %s evidence", async evidence => {
+    const { company, agent } = await fixture();
+    const [run] = await db.insert(heartbeatRuns).values({ companyId: company.id, agentId: agent.id,
+      status: "running", runtimeMode: "native", startedAt: new Date() }).returning();
+    const deps = callbacks(db);
+    if (evidence === "local exit" || evidence === "later launch") {
+      const child = spawn(process.execPath, ["-e", "setTimeout(() => process.exit(0), 50)"], { detached: true, stdio: "ignore" });
+      const exited = once(child, "exit");
+      try {
+        expect(child.pid).toBeGreaterThan(1);
+        await deps.persistRunProcessMetadata(run.id, { pid: child.pid!, processGroupId: child.pid!,
+          startedAt: new Date().toISOString(), targetKind: "local" });
+        await exited;
+      } finally { if (child.exitCode === null) child.kill("SIGKILL"); }
+      if (evidence === "later launch") await deps.appendRunEvent(run, {
+        eventType: PROCESS_START_REQUESTED, stream: "system", level: "info", message: "A later launch invalidated the earlier exit proof",
+      });
+    }
+    if (evidence === "remote receipt") {
+      const leaseId = randomUUID(), providerLeaseId = randomUUID();
+      await db.insert(environmentLeases).values({ id: leaseId, companyId: company.id, heartbeatRunId: run.id,
+        provider: "daytona", providerLeaseId, status: "released", releasedAt: new Date(), cleanupStatus: "success",
+        metadata: { remoteExecutionTermination: { schema: "paperclip.remote-termination.v1", companyId: company.id,
+          runId: run.id, leaseId, provider: "daytona", providerLeaseId, state: "stopped", confirmedAt: new Date().toISOString() } },
+      });
+    }
+    const getRun = deps.getRun.getMockImplementation()!;
+    deps.getRun.mockImplementationOnce(async id => {
+      // Budget delivery persisted its fence, then ordinary native completion
+      // won the race before this run acquired a provider Stop delivery slot.
+      expect((await getRun(id))?.resultJson?.startupCancellation).toBeTruthy();
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date(), nativePhase: "committed",
+        processPid: null, processGroupId: null, processStartedAt: null }).where(eq(heartbeatRuns.id, id));
+      return getRun(id);
+    });
+    const policyId = randomUUID();
+    await db.insert(budgetPolicies).values({ id: policyId, companyId: company.id, scopeType: "agent",
+      scopeId: agent.id, windowKind: "lifetime", amount: 1, enforcementVersion: 1 });
+    await db.insert(costEvents).values({ companyId: company.id, agentId: agent.id, provider: "test",
+      model: "overrun", inputTokens: 1, outputTokens: 1, costCents: 2, occurredAt: new Date() });
+    const scope = { companyId: company.id, scopeType: "agent" as const, scopeId: agent.id,
+      enforcement: { policyId, version: 1 } };
+    const control = createHeartbeatRunControl(db, deps);
+    const succeeded = evidence === "local exit" || evidence === "remote receipt";
+    const delivery = control.cancelBudgetScopeWork(scope);
+    if (succeeded) await delivery;
+    else await expect(delivery).rejects.toThrow("Budget cancellation delivery remains pending");
+    const persisted = await getRun(run.id);
+    expect(persisted).toMatchObject({ status: "succeeded", nativePhase: "committed" });
+    expect(persisted?.resultJson?.executionCancellation).toBeUndefined();
+    const intent = (persisted?.resultJson?.startupCancellation as { budgetEnforcement?: Record<string, unknown> })?.budgetEnforcement;
+    if (succeeded) expect(intent).toMatchObject({ deliveredAt: expect.any(String),
+      terminationProof: evidence === "local exit" ? "local_process_exit" : "provider_termination_receipt" });
+    else expect(intent?.deliveredAt).toBeUndefined();
+    expect(await listPendingBudgetCancellationScopes(db)).toHaveLength(succeeded ? 0 : 1);
+    expect(terminateLocalService).not.toHaveBeenCalled();
+    expect(deps.setRunStatusFromLive).not.toHaveBeenCalled();
+  });
+
   it("moves an attempted failed Stop behind another pending scope", async () => {
     const { company, agent } = await fixture();
     const [otherAgent] = await db.insert(agents).values({ companyId: company.id, name: "Later recovery" }).returning();
@@ -1034,5 +1097,58 @@ describe.skipIf(!support.supported)("heartbeat run-control database wiring", () 
     await createHeartbeatRunControl(db, callbacks(db)).cancelBudgetScopeWork({ companyId: company.id, scopeType: "project", scopeId: projectRows[0].id, createdBefore: cutoff });
     const persisted = await db.select().from(agentWakeupRequests);
     expect(wakes.map(wake => persisted.find(row => row.id === wake.id)?.status)).toEqual(["cancelled", "queued", "queued", "queued"]);
+  });
+
+  it("fences detached browsers after their parent run finishes using admitted project scope and cutoff", async () => {
+    const { company, agent } = await fixture();
+    const [project, otherProject] = await db.insert(projects).values([
+      { companyId: company.id, name: "Stopped project" }, { companyId: company.id, name: "Other project" },
+    ]).returning();
+    const [movedIssue, targetIssue] = await db.insert(issues).values([
+      { companyId: company.id, projectId: otherProject.id, title: "Moved after browser admission" },
+      { companyId: company.id, projectId: project.id, title: "Current project" },
+    ]).returning();
+    const [parent] = await db.insert(heartbeatRuns).values({ companyId: company.id, agentId: agent.id,
+      status: "succeeded", finishedAt: new Date(), runtimeMode: "legacy" }).returning();
+    const [application] = await db.insert(toolApplications).values({ companyId: company.id, name: "Browser fixture", type: "rest_api" }).returning();
+    const [connection] = await db.insert(toolConnections).values({ companyId: company.id, applicationId: application.id,
+      name: "Browser fixture", uid: "budget-browser-fixture", transport: "rest_api" }).returning();
+    const [grant] = await db.insert(connectionGrants).values({ companyId: company.id, connectionId: connection.id, kind: "organization" }).returning();
+    const cutoff = new Date();
+    const old = new Date(cutoff.getTime() - 1_000);
+    const later = new Date(cutoff.getTime() + 60_000);
+    const [admitted, other, legacy, newer, noProject] = await db.insert(browserUseSessions).values([
+      { issueId: movedIssue.id, stopRequested: "cancel" }, { issueId: targetIssue.id },
+      { issueId: targetIssue.id }, { issueId: targetIssue.id, createdAt: later }, { issueId: targetIssue.id },
+    ].map(values => ({ companyId: company.id, agentId: agent.id, connectionId: connection.id, grantId: grant.id,
+      providerSessionId: randomUUID(), status: "running", createdAt: old, nextPollAt: later,
+      leaseToken: randomUUID(), leaseUntil: later, error: "retained cleanup context", ...values }))).returning();
+    await db.insert(browserUseRuns).values([admitted, other, legacy, noProject].map((session, index) => {
+      const invocationId = randomUUID();
+      return { companyId: company.id, sessionId: session.id, heartbeatRunId: parent.id, invocationId,
+        status: "running", detachedUntil: later, createdAt: old,
+        result: index === 2 ? null : { paperclipBudgetHold: { invocationId, amountCents: "10", state: "held",
+          projectId: index === 0 ? project.id : index === 1 ? otherProject.id : null } },
+      };
+    }));
+    const wake = vi.fn();
+    const unsubscribe = subscribeDeliveryWork(db, DELIVERY_QUEUES.browser, wake);
+    const deps = callbacks(db);
+    try {
+      await createHeartbeatRunControl(db, deps).cancelBudgetScopeWork({ companyId: company.id,
+        scopeType: "project", scopeId: project.id, createdBefore: cutoff });
+      const persisted = await db.select().from(browserUseSessions).where(eq(browserUseSessions.companyId, company.id));
+      for (const original of [admitted, legacy]) {
+        const stopped = persisted.find(session => session.id === original.id)!;
+        expect(stopped).toMatchObject({ status: "stopping", stopRequested: "end", providerSessionId: original.providerSessionId,
+          leaseToken: original.leaseToken, leaseUntil: original.leaseUntil, error: original.error });
+        expect(stopped.nextPollAt.getTime()).toBeLessThan(later.getTime());
+      }
+      for (const original of [other, newer, noProject]) expect(persisted.find(session => session.id === original.id)).toEqual(original);
+      expect(await deps.getRun(parent.id)).toMatchObject({ status: "succeeded", resultJson: null });
+      expect(wake).toHaveBeenCalledTimes(1);
+      expect(terminateLocalService).not.toHaveBeenCalled();
+      expect(deps.setRunStatusFromLive).not.toHaveBeenCalled();
+    } finally { unsubscribe(); }
   });
 });

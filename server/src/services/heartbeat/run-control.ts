@@ -1,5 +1,5 @@
 import { readTaskRetryIntent, reconcileTaskChatRetryReceipts } from "../task-retry.js";
-import { recordedLocalExecutionStopped } from "../native-local-process-stop.js";
+import { PROCESS_IDENTITY_RECORDED, PROCESS_START_REQUESTED, readNativeLocalProcessStop, recordedLocalExecutionStopped } from "../native-local-process-stop.js";
 import { isHeartbeatRunTerminalStatus } from "./run-lifecycle.js";
 import { pendingCaseHandoffForRun, cancelCaseHandoffsForIssue, isCaseHandoffSourceReleased } from "./case-handoff-lifecycle.js";
 import { publishActivity, type ActivityPublication } from "../activity-log.js";
@@ -84,9 +84,12 @@ import {
 } from "@paperclipai/shared";
 import {
   agentWakeupRequests,
+  browserUseRuns,
+  browserUseSessions,
   companies,
   environmentLeases,
   heartbeatRuns,
+  heartbeatRunEvents,
   issueComments,
   issueRecoveryActions,
   issues,
@@ -98,6 +101,7 @@ import {
   notFound,
 } from "../../errors.js";
 import { logger } from "../../middleware/logger.js";
+import { DELIVERY_QUEUES, notifyDeliveryWork } from "../delivery-work-notifications.js";
 import {
   queuedCommentIdsFromWakePayload,
   withQueuedCommentIdsInWakePayload,
@@ -1009,12 +1013,20 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
     return cancelRun(runId, reason, options);
   }
 
-  async function acknowledgeBudgetCancellation(run: typeof heartbeatRuns.$inferSelect) {
+  async function acknowledgeBudgetCancellation(run: typeof heartbeatRuns.$inferSelect, terminationProof?: string) {
     if (!parseObject(parseObject(run.resultJson?.startupCancellation).budgetEnforcement).scopeType) return;
-    await db.update(heartbeatRuns).set({ resultJson: sql`jsonb_set(${heartbeatRuns.resultJson},
-      '{startupCancellation,budgetEnforcement,deliveredAt}', ${JSON.stringify(new Date().toISOString())}::jsonb)` })
+    const acknowledged = await db.update(heartbeatRuns).set({ resultJson: sql`jsonb_set(${heartbeatRuns.resultJson},
+      '{startupCancellation,budgetEnforcement}', ${heartbeatRuns.resultJson}->'startupCancellation'->'budgetEnforcement'
+        || ${JSON.stringify({ deliveredAt: new Date().toISOString(), ...(terminationProof ? { terminationProof } : {}) })}::jsonb)` })
       .where(and(eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.id, run.id),
-        pendingBudgetRunCancellationPredicate()));
+        pendingBudgetRunCancellationPredicate(),
+        terminationProof ? and(eq(heartbeatRuns.status, run.status), eq(heartbeatRuns.nextEventSeq, run.nextEventSeq),
+          sql`${heartbeatRuns.processPid} is not distinct from ${run.processPid}`,
+          sql`${heartbeatRuns.processGroupId} is not distinct from ${run.processGroupId}`,
+          sql`${heartbeatRuns.processStartedAt} is not distinct from ${run.processStartedAt?.toISOString() ?? null}::timestamptz`) : undefined,
+      )).returning({ id: heartbeatRuns.id });
+    if (terminationProof && !acknowledged.length)
+      throw conflict("Execution evidence changed before acknowledging budget Stop", { runId: run.id });
   }
 
   function hasRecordedStopAcknowledgement(run: typeof heartbeatRuns.$inferSelect) {
@@ -1025,6 +1037,39 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
       && intent.scope === "run" && intent.reasonCode === "cancellation_run_only"
       && intent.dispatchState === "acknowledged" && intent.dispatched === true
       && typeof intent.intentAuditId === "string" && typeof intent.acknowledgementAuditId === "string";
+  }
+
+  async function completedRunTerminationProof(run: typeof heartbeatRuns.$inferSelect): Promise<string | null> {
+    // Logical completion can win the race with queued Stop delivery. It does
+    // not prove a provider exited, and an in-process owner must still settle.
+    if (!isHeartbeatRunTerminalStatus(run.status) || activeRunExecutions.has(run.id) ||
+      runningProcesses.has(run.id) || adapterExecutionControls.has(run.id) || processRunCancellationSettlements.has(run.id)) return null;
+    const leases = await db.select().from(environmentLeases).where(and(
+      eq(environmentLeases.companyId, run.companyId), eq(environmentLeases.heartbeatRunId, run.id),
+    ));
+    if (leases.some(lease => lease.provider !== "local"))
+      return leases.every(hasRemoteTerminationReceipt) ? "provider_termination_receipt" : null;
+    if (run.processPid || run.processGroupId || run.processStartedAt)
+      return await recordedLocalExecutionStopped(db, run) ? "local_process_exit" : null;
+    if (await readNativeLocalProcessStop(db, run.companyId, run.id)) return "local_process_stop_receipt";
+    // Normal native finalization clears mutable process fields. Rebind the
+    // latest server-owned launch identity before checking that exact local
+    // process and group. Any newer start invalidates the older observation.
+    const [identity] = await db.select({ eventType: heartbeatRunEvents.eventType, payload: heartbeatRunEvents.payload })
+      .from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.companyId, run.companyId),
+        eq(heartbeatRunEvents.runId, run.id), isNull(heartbeatRunEvents.sourceEventId),
+        inArray(heartbeatRunEvents.eventType, [PROCESS_START_REQUESTED, PROCESS_IDENTITY_RECORDED, "native.local_process_stopped"])))
+      .orderBy(desc(heartbeatRunEvents.seq)).limit(1);
+    const recorded = identity?.payload;
+    if (identity?.eventType !== PROCESS_IDENTITY_RECORDED || typeof recorded?.processPid !== "number" ||
+      !Number.isSafeInteger(recorded.processPid) || recorded.processPid <= 1 ||
+      (recorded.processGroupId !== null && (typeof recorded.processGroupId !== "number" ||
+        !Number.isSafeInteger(recorded.processGroupId) || recorded.processGroupId <= 1)) ||
+      typeof recorded.processStartedAt !== "string") return null;
+    const processStartedAt = new Date(recorded.processStartedAt);
+    if (Number.isNaN(processStartedAt.getTime())) return null;
+    return await recordedLocalExecutionStopped(db, { ...run, processPid: recorded.processPid,
+      processGroupId: recorded.processGroupId, processStartedAt }) ? "local_process_exit" : null;
   }
 
   function deliveredBudgetCancellationResult(run: typeof heartbeatRuns.$inferSelect, deliveredAt: Date) {
@@ -1136,10 +1181,11 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
       )
     ) {
       if (committedBudgetCancellation) {
-        if (!hasRecordedStopAcknowledgement(run)) {
+        const terminationProof = hasRecordedStopAcknowledgement(run) ? undefined : await completedRunTerminationProof(run);
+        if (terminationProof === null) {
           throw conflict("Budget Stop is committed, but provider termination has not been acknowledged", { runId: run.id });
         }
-        await acknowledgeBudgetCancellation(run);
+        await acknowledgeBudgetCancellation(run, terminationProof);
       }
       return run;
     }
@@ -1523,12 +1569,40 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
     };
   }
 
+  async function stopBrowserSessionsForBudgetScope(tx: Db, scope: BudgetEnforcementScope) {
+    // Browser work can outlive its terminal parent run. Its admitted project
+    // snapshot remains authoritative even if the task moves to another project.
+    const activeHold = sql`(select ${browserUseRuns.result}->'paperclipBudgetHold'
+      from ${browserUseRuns} where ${browserUseRuns.companyId} = ${browserUseSessions.companyId}
+        and ${browserUseRuns.sessionId} = ${browserUseSessions.id}
+        and ${browserUseRuns.result}->'paperclipBudgetHold'->>'state' = 'held'
+        and ${browserUseRuns.result}->'paperclipBudgetHold'->>'invocationId' = ${browserUseRuns.invocationId}::text
+      order by ${browserUseRuns.createdAt} desc, ${browserUseRuns.id} desc limit 1)`;
+    const project = sql`case when ${activeHold} ? 'projectId' then ${activeHold}->>'projectId'
+      else (select ${issues.projectId}::text from ${issues}
+        where ${issues.id} = ${browserUseSessions.issueId} and ${issues.companyId} = ${scope.companyId}) end`;
+    const sessions = await tx.select({ id: browserUseSessions.id }).from(browserUseSessions).where(and(
+      eq(browserUseSessions.companyId, scope.companyId),
+      inArray(browserUseSessions.status, ["starting", "running", "idle", "stopping"]),
+      scope.scopeType === "agent" ? eq(browserUseSessions.agentId, scope.scopeId) : undefined,
+      scope.scopeType === "project" ? sql`${project} = ${scope.scopeId}` : undefined,
+      scope.createdBefore ? lt(browserUseSessions.createdAt, scope.createdBefore) : undefined,
+    )).for("update");
+    if (!sessions.length) return;
+    await notifyDeliveryWork(tx, DELIVERY_QUEUES.browser, scope.companyId);
+    await tx.update(browserUseSessions).set({ status: "stopping", stopRequested: "end",
+      nextPollAt: new Date(), updatedAt: new Date(),
+    }).where(and(eq(browserUseSessions.companyId, scope.companyId),
+      inArray(browserUseSessions.id, sessions.map(session => session.id))));
+  }
+
   async function cancelBudgetScopeWork(scope: BudgetEnforcementScope) {
     const reason = "Cancelled due to budget pause";
     const newlyFenced = await withCurrentBudgetEnforcement(db, scope, async (tx) => {
       // Queue admission and every selected run lose authority in this commit,
       // before any provider can delay cancellation delivery.
       await cancelPendingWakeupsForBudgetScope(scope, tx);
+      await stopBrowserSessionsForBudgetScope(tx, scope);
       const candidates = scope.scopeType === "project"
         ? await listProjectScopedRunIds(scope.companyId, scope.scopeId, scope.createdBefore, tx)
         : await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
