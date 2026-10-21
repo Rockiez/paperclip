@@ -100,6 +100,11 @@ describe("live exposure across provider attempts", () => {
     expect(observe("next", { ...openai, costUsd: 0.3 })).toBe("170.0000000");
   });
 
+  it("restores explicit unknown exposure without pricing unsafe compatibility aggregates", () => {
+    const observe = createLiveRunUsageProjection({ receipt: { ...openai, costUsd: 100 }, costCents: null });
+    expect(observe("default", { ...openai, model: "unsupported" })).toBeNull();
+  });
+
   it("keeps unpriced attempts unknown while retaining known portions", () => {
     const observe = createLiveRunUsageProjection();
     expect(observe("unknown", { ...openai, usageBasis: "session_cumulative", costUsd: 100 })).toBeNull();

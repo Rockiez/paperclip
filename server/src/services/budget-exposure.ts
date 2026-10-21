@@ -50,13 +50,21 @@ function normalizedNumericCents(value: SQL, usd = false) {
 
 const usage = heartbeatRuns.usageJson;
 const projected = normalizedNumericCents(sql`${usage}->'budgetExposure'->>'costCents'`);
+const hasProjection = sql`jsonb_typeof(${usage}->'budgetExposure') = 'object'
+  and jsonb_typeof(${usage}->'budgetExposure'->'sourceId') = 'string'
+  and jsonb_typeof(${usage}->'budgetExposure'->'sequence') = 'number'`;
 const legacy = sql`case when coalesce(${usage}->>'usageSource', 'per_run') <> 'session_cumulative'
   and coalesce(${usage}->>'usageBasis', 'per_run') <> 'session_cumulative' then
   coalesce(${normalizedNumericCents(sql`${usage}->>'cacheAdjustedCostUsd'`, true)},
   ${normalizedNumericCents(sql`${usage}->>'costUsdExact'`, true)}, ${normalizedNumericCents(sql`${usage}->>'costUsd'`, true)}) else null end`;
+// The projection already separates attempts and cumulative/session counters.
+// Raw compatibility fields are a fallback, never stronger monetary evidence.
+// A canonical unknown projection must remain unknown, not inherit an unsafe
+// cumulative aggregate retained only for old accounting compatibility.
 const liveCost = sql`case when ${heartbeatRuns.costAccountedAt} is null and ${heartbeatRuns.id} is not null
   and coalesce(${usage}->>'billingType', '') not in ('subscription_included', 'subscription')
-  then greatest(coalesce(${projected}, 0), coalesce(${legacy}, 0)) else 0 end`;
+  then case when ${hasProjection} then coalesce(${projected}, 0)
+    else coalesce(${projected}, ${legacy}, 0) end else 0 end`;
 
 /** Batched ledger, held-operation and unfinished-run aggregates. Never scans
  * agents or receipt history; each policy retains its own scope and window. */

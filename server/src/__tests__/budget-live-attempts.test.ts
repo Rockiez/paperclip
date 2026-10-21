@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { agents, budgetPolicies, companies, costEvents, createDb, heartbeatRuns, type Db } from "@paperclipai/db";
+import { agents, budgetPolicies, budgetReservations, companies, costEvents, createDb, heartbeatRuns, type Db } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { computeObservedSpend } from "../services/budgets.js";
 import { accountRunCost } from "../services/run-cost-accounting.js";
@@ -25,7 +25,7 @@ const support = await getEmbeddedPostgresTestSupport();
   });
   afterAll(async () => { await database?.cleanup(); });
 
-  async function fixture() {
+  async function fixture(rejectedZero = true) {
     const companyId = randomUUID(), agentId = randomUUID(), runId = randomUUID();
     await db.insert(companies).values({ id: companyId, name: "Live attempts", issuePrefix: "LAT" });
     await db.insert(agents).values({ id: agentId, companyId, name: "Provider", adapterType: "codex_local" });
@@ -43,7 +43,7 @@ const support = await getEmbeddedPostgresTestSupport();
     const recorder = await createRunUsageRecorder(proxy, { companyId, runId, adapterType: "codex_local" }, directory);
     const identity = { usageBasis: "per_run" as const, provider: "openai", biller: "openai",
       billingType: "metered_api" as const, model: "gpt-6.1-sol" };
-    await recorder.capture({ ...identity, attemptId: randomUUID(), complete: true,
+    if (rejectedZero) await recorder.capture({ ...identity, attemptId: randomUUID(), complete: true,
       usage: { inputTokens: 0, outputTokens: 0 }, costUsd: 0, costStatus: "reported" });
     const paidAttemptId = randomUUID();
     const partial = { ...identity, attemptId: paidAttemptId, complete: false,
@@ -97,5 +97,25 @@ const support = await getEmbeddedPostgresTestSupport();
       usageSource: "per_run", budgetExposure: { costCents: "20.0000000" } });
     expect((await computeObservedSpend(db, f.policy)).liveObservedCents).toBe("20.0000000");
     expect((await db.select().from(agents).where(eq(agents.id, f.agentId)))[0].lifecycleHolds).not.toContain("budget");
+  });
+
+  it("does not resurrect cumulative USD when the normalized per-run attempt remains unpriced", async () => {
+    const f = await fixture(false);
+    await db.insert(budgetReservations).values({ companyId: f.companyId, agentId: f.agentId, runId: f.runId, amountCents: "10" });
+    await f.recorder.capture({ ...f.identity, attemptId: randomUUID(), usageBasis: "session_cumulative",
+      complete: true, costUsd: 100, usage: { inputTokens: 100, outputTokens: 100 } });
+    const unknownAttemptId = randomUUID();
+    await f.recorder.capture({ ...f.identity, attemptId: unknownAttemptId, model: "unsupported", complete: false,
+      usage: { inputTokens: 20, outputTokens: 20 } });
+    await f.recorder.capture({ ...f.identity, attemptId: unknownAttemptId, model: "unsupported", complete: false,
+      usage: { inputTokens: 30, outputTokens: 30 } });
+    expect((await f.readRun()).usageJson).toMatchObject({ costUsdExact: "100.000000000",
+      costStatus: "unpriced", accountingReceiptReady: false, usageSource: "per_run", budgetExposure: { costCents: null } });
+    expect(await computeObservedSpend(db, f.policy)).toMatchObject({ liveObservedCents: "0.0000000", effectiveHeldCents: "10.0000000" });
+    await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date() }).where(eq(heartbeatRuns.id, f.runId));
+    expect(await accountRunCost(db, f.runId)).toBe(false);
+    expect((await db.select().from(budgetReservations).where(eq(budgetReservations.runId, f.runId)))[0].state).toBe("held");
+    expect((await f.readRun()).costAccountingPending).toBe(true);
+    expect(await db.select().from(costEvents)).toEqual([]);
   });
 });
