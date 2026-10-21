@@ -384,7 +384,7 @@ describe.skipIf(!support.supported)("heartbeat workspace preparation boundary", 
   });
 
   it("keeps a plugin workspace ledger across runs without preparing Core repositories", async () => {
-    const { input, issue, envOrchestrator } = await fixture();
+    const { input, issue, envOrchestrator, source } = await fixture();
     input.agent.adapterType = "paperclip_runner";
     input.environment.selectedEnvironmentForConfig = { ...input.environment.localEnvironment, driver: "plugin" };
     const guestOnly = join(home, "guest-only", issue.projectId!);
@@ -408,6 +408,15 @@ describe.skipIf(!support.supported)("heartbeat workspace preparation boundary", 
       resultJson: { reason: "plugin_workspace_owner_mismatch" },
     });
     expect(realize).toHaveBeenCalledTimes(2);
+    input.environment.selectedEnvironmentForConfig = { ...input.environment.localEnvironment, driver: "plugin" };
+    const [localWorkspace] = await db.update(executionWorkspaces).set({ providerType: "local_fs", cwd: source, metadata: {} })
+      .where(eq(executionWorkspaces.id, firstId)).returning();
+    await reuse(input, toExecutionWorkspace(localWorkspace));
+    await expect(prepareHeartbeatWorkspace(db, input)).rejects.toMatchObject({
+      resultJson: { reason: "plugin_workspace_owner_mismatch" },
+    });
+    expect(realize).toHaveBeenCalledTimes(2);
+    expect(await readFile(join(source, "README.md"), "utf8")).toBe("source content\n");
   });
 
   it.each(["services", "fresh"] as const)("rejects unsupported %s before plugin workspace preparation or acquisition", async mode => {

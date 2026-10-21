@@ -225,8 +225,9 @@ async function prepareHeartbeatWorkspaceLocked(db: Db, input: HeartbeatWorkspace
     pluginKey: pluginConfig.pluginKey ?? null, driverKey: pluginConfig.driverKey ?? null } : null;
   for (const workspace of [existingExecutionWorkspace, reusableExistingExecutionWorkspace]) {
     const owner = parseObject(workspace?.metadata?.runnerTaskWorkspaceOwner);
-    if (Object.keys(owner).length && (!taskWorkspaceOwner || Object.entries(taskWorkspaceOwner).some(([key, value]) => owner[key] !== value))) {
-      throw new WorkspaceValidationFailure("The retained workspace belongs to a different agent or plugin environment.",
+    if ((pluginTaskWorkspace && workspace && workspace.providerType !== "plugin" && Object.keys(owner).length === 0)
+        || (Object.keys(owner).length > 0 && (!taskWorkspaceOwner || Object.entries(taskWorkspaceOwner).some(([key, value]) => owner[key] !== value)))) {
+      throw new WorkspaceValidationFailure("The retained workspace belongs to a different agent, environment, or storage provider.",
         { reason: "plugin_workspace_owner_mismatch" });
     }
   }

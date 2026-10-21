@@ -31,6 +31,7 @@ Core passes the pinned workspace binding with each task operation.
 Core rejects configured workspace services for task-only environments.
 Fresh retries that import retained files are not supported for plugin storage.
 An agent-owned workspace cannot move to another agent or environment.
+Core also rejects reuse of a local workspace in a task-only environment.
 Keep its original owner, or use the workspace storage provider contract.
 
 ## Prepare and launch
