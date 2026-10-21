@@ -4,8 +4,10 @@ Product map: [Costs, budgets, and spending controls](../feature-map/budgets-cost
 
 Feature ID: `budgets-costs`.
 
-Budget authority is revalidated at paid-work dispatch under the company accounting
-lock. Company, applicable agent, and applicable project limits include unsettled
+Budget admission commits under the company accounting lock. A separate ownership
+transaction rechecks scope and capacity immediately before provider handoff;
+provider work does not hold the company accounting lock. Company, applicable
+agent, and applicable project limits include unsettled
 observed run usage and reservations without counting either twice. A committed
 hard stop prevents fresh provider work immediately; scoped cancellation delivery
 runs asynchronously and preserves existing Stop acknowledgement and recovery

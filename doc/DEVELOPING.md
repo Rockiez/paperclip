@@ -3113,18 +3113,22 @@ Unfinished uncapped browsers and legacy rows without a reliable exposure record
 remain unknown usage when a new budget is introduced. The existing unpriced-usage
 policy controls admission until their terminal charge is known.
 
-Use a disposable real PostgreSQL database to compare the cost-evaluation boundary:
+Use a disposable real PostgreSQL database to compare cost evaluation and complete admission:
 
 ```sh
 pnpm --filter @paperclipai/server exec tsx ../scripts/benchmark-budget-enforcement.ts --baseline-ref=6c9b87d0922f1ebfc43e8b0c36889ac5ba7b9837 > /tmp/budget-forward.json
 pnpm --filter @paperclipai/server exec tsx ../scripts/benchmark-budget-enforcement.ts --baseline-ref=6c9b87d0922f1ebfc43e8b0c36889ac5ba7b9837 --reverse > /tmp/budget-reverse.json
 ```
 
-Each comparison keeps one company policy and no active runs while adding 0, 17,
-and 1,000 unrelated idle agents. It records 20 warm samples, SQL statement counts,
+The cost comparison keeps one company policy and no active runs while adding 0,
+17, and 1,000 unrelated idle agents. It records 20 warm samples, SQL statement counts,
 company accounting locks, agent reads, and an `EXPLAIN (ANALYZE, BUFFERS)` plan.
 It asserts unchanged agent state and no agent reads in the new evaluation path.
-The baseline service and lifecycle modules come from the supplied Git revision.
+The harness also measures reservation, the final ownership gate, and an immediate
+offline provider result with one responsible agent and one active operation. It
+records transaction counts and asserts no reads of unrelated agents. Baseline
+service, lifecycle, reservation, and dispatch modules come from the supplied Git
+revision.
 Provider inference, network latency, stop acknowledgement, and hosted database
 latency need separate measurements. Do not run this benchmark beside test suites
 or builds when reporting timing results.
