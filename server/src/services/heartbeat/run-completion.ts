@@ -20,7 +20,7 @@ import { HttpError } from "../../errors.js";
 import { logger } from "../../middleware/logger.js";
 import { normalizeResponsibleUserDenialCode } from "../responsible-user-denial-run-outcomes.js";
 import { parseObject } from "../../adapters/utils.js";
-import { CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON, isExternalChatPresentationContext, mergeHeartbeatRunResultJson, resolveHeartbeatRunResponse, type RunPresentationDecision } from "../heartbeat-run-summary.js";
+import { CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON, isChatOriginPublicationCandidate, isExternalChatPresentationContext, mergeHeartbeatRunResultJson, resolveHeartbeatRunResponse, type RunPresentationDecision } from "../heartbeat-run-summary.js";
 import { normalizeMaxTurnStopReason } from "../heartbeat-stop-metadata.js";
 import { CHAT_CONTROL_RECOVERY_UNRESOLVED_CODE } from "../chat-control-recovery-stop.js";
 import { logActivity } from "../activity-log.js";
@@ -789,12 +789,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
             livenessRun.id,
             livenessRun.companyId,
           ));
-        const externalChatPresentationCandidate =
-          isExternalChatPresentationContext(livenessRun.contextSnapshot) ||
-          parseObject(livenessRun.contextSnapshot).source === "issue.monitor" ||
-          parseObject(livenessRun.contextSnapshot).source === "tool_action_review" ||
-          String(parseObject(livenessRun.contextSnapshot).source ?? "").startsWith("issue.comment") ||
-          parseObject(livenessRun.contextSnapshot).source === "issue.update";
+        const externalChatPresentationCandidate = isChatOriginPublicationCandidate(livenessRun.contextSnapshot);
         const externalChatPresentationAuthorization =
           issueId && externalChatPresentationCandidate
             ? await measureRunPhase("response.authorize", () => resolveChatRunPresentationAuthorizationReason(db, {

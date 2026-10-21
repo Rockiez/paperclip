@@ -8,7 +8,7 @@ import {
 } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../__tests__/helpers/embedded-postgres.js";
 import { enqueueChatRunMilestones, resolveChatRunPresentationAuthorizationReason } from "./chat-run-publications.js";
-import { CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON } from "./heartbeat-run-summary.js";
+import { CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON, isChatOriginPublicationCandidate, isExternalChatPresentationContext, resolveHeartbeatRunResponse } from "./heartbeat-run-summary.js";
 import { resolveChatOriginPublicationBindings } from "./issues.js";
 import { NativeRunCoordinatorStore } from "./native-runtime/native-run-coordinator-store.js";
 import { finalizeNativeRun, repairCommittedNativeChatResponse } from "./native-runtime/native-run-finalizer.js";
@@ -194,6 +194,21 @@ if (!support.supported) console.warn(`Monitor publication database unavailable: 
     expect(publications.some(p => p.payload.progressState === "working" && p.conversationId === f.conversation.id)).toBe(true);
     expect(await repairCommittedNativeChatResponse(db, { companyId: f.company.id, issueId: f.issue.id, runId: f.source.id })).toBe(false);
     expect(await db.select().from(nativeRunResults).where(eq(nativeRunResults.runId, f.source.id))).toHaveLength(1);
+  });
+
+  it("selects the continued chat run's completed answer over an earlier bookkeeping comment", async () => {
+    const f = await continuedTaskFixture();
+    const authorization = isChatOriginPublicationCandidate(f.successor.contextSnapshot)
+      ? await resolveChatRunPresentationAuthorizationReason(db, { companyId: f.company.id, issueId: f.issue.id, runId: f.successor.id }) : null;
+    const context = isExternalChatPresentationContext(f.successor.contextSnapshot, authorization === CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON);
+    const answer = "Migration QA is complete. The verified report is available at the attached result.";
+    const resolved = resolveHeartbeatRunResponse({ resultJson: {},
+      existingComment: { id: "earlier-comment", body: "The checkout is ready; QA is underway." },
+      finalAgentMessage: { text: answer, channel: "final", sourceEventId: "completed-final" },
+      preferFinalResponseOverExistingComment: context,
+    });
+    expect(resolved.text).toBe(answer);
+    expect(resolved.decision).toMatchObject({ chosenSource: "final_agent_message", commentAction: "create" });
   });
 
   it.each(["effect", "decision", "wake", "dispatch", "requester", "agent"])("rejects automatic continuation when %s authority is no longer valid", async fault => {
