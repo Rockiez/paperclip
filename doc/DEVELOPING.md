@@ -3103,6 +3103,9 @@ lifecycle effects run through the delivery coordinator after accounting commits.
 The final provider gate commits a dispatch claim before entering provider code.
 The reservation and native recovery lease generation fence duplicate handoffs;
 neither provider startup nor termination holds the company accounting lock.
+After accounting commits, a short ownership transaction rechecks the current
+task/run fences and covers the synchronous adapter handoff. It commits without
+awaiting provider bootstrap, results, or finalization.
 Hosted browser operations retain their own hold and admitted project in existing
 run metadata. Unknown provider outcomes retain that capacity until accounting
 establishes the charge. Browser holds are separate from their parent run's usage.
