@@ -137,7 +137,7 @@ describe("heartbeat workspace module", () => {
       const result = await createHeartbeatWorkspaceResolver(database.db).resolveWorkspaceForRun(
         { ...agent(), adapterType: "paperclip_runner" }, { projectId: "project-one" }, null,
         { executionEnvironmentDriver: "plugin" });
-      expect(result).toMatchObject({ cwd: ".", projectId: "project-one", workspaceId: "selected", repoUrl,
+      expect(result).toMatchObject({ cwd: "/workspaces/selected", projectId: "project-one", workspaceId: "selected", repoUrl,
         source: "project_primary", baseCwdFallback: false, additionalWorkspaces: [] });
       expect(stat).not.toHaveBeenCalled(); expect(mkdir).not.toHaveBeenCalled();
     } finally { stat.mockRestore(); mkdir.mockRestore(); }
@@ -147,7 +147,7 @@ describe("heartbeat workspace module", () => {
     try {
       const result = await createHeartbeatWorkspaceResolver(databaseWithResults().db).resolveWorkspaceForRun(
         { ...agent(), adapterType: "paperclip_runner" }, {}, null, { executionEnvironmentDriver: "plugin" });
-      expect(result).toMatchObject({ cwd: ".", projectId: null, workspaceId: null });
+      expect(result).toMatchObject({ cwd: "/workspaces/agent-one", projectId: null, workspaceId: null });
       expect(mkdir).not.toHaveBeenCalled();
     } finally { mkdir.mockRestore(); }
   });

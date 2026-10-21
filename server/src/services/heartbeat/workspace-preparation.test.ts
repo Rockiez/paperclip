@@ -403,6 +403,23 @@ describe.skipIf(!support.supported)("heartbeat workspace preparation boundary", 
     expect(realize).toHaveBeenCalledTimes(2);
     expect(copy).not.toHaveBeenCalled(); expect(restoredCopy).not.toHaveBeenCalled();
     await expect(access(guestOnly)).rejects.toMatchObject({ code: "ENOENT" });
+    input.environment.selectedEnvironmentForConfig = input.environment.localEnvironment;
+    await expect(prepareHeartbeatWorkspace(db, input)).rejects.toMatchObject({
+      resultJson: { reason: "plugin_workspace_owner_mismatch" },
+    });
+    expect(realize).toHaveBeenCalledTimes(2);
+  });
+
+  it("rejects configured Core services before plugin workspace preparation or acquisition", async () => {
+    const { input, envOrchestrator } = await fixture();
+    input.agent.adapterType = "paperclip_runner";
+    input.environment.selectedEnvironmentForConfig = { ...input.environment.localEnvironment, driver: "plugin" };
+    input.config.mergedConfig.workspaceRuntime = { services: [{ name: "preview", command: "must-not-run-on-core" }] };
+    const acquire = vi.spyOn(envOrchestrator, "acquireForRun");
+    await expect(prepareHeartbeatWorkspace(db, input)).rejects.toMatchObject({
+      resultJson: { reason: "plugin_workspace_services_unsupported" },
+    });
+    expect(acquire).not.toHaveBeenCalled();
   });
 
   it("admits the metadata-only agent-default strategy for a plugin workspace", async () => {

@@ -216,6 +216,21 @@ async function prepareHeartbeatWorkspaceLocked(db: Db, input: HeartbeatWorkspace
     appendRunEvent,
   } = input.services;
   const pluginTaskWorkspace = selectedEnvironmentForConfig?.driver === "plugin" && agent.adapterType === "paperclip_runner";
+  const pluginConfig = parseObject(selectedEnvironmentForConfig?.config);
+  const taskWorkspaceOwner = pluginTaskWorkspace ? { agentId: agent.id, environmentId: selectedEnvironmentForConfig.id,
+    pluginKey: pluginConfig.pluginKey ?? null, driverKey: pluginConfig.driverKey ?? null } : null;
+  for (const workspace of [existingExecutionWorkspace, reusableExistingExecutionWorkspace]) {
+    const owner = parseObject(workspace?.metadata?.runnerTaskWorkspaceOwner);
+    if (Object.keys(owner).length && (!taskWorkspaceOwner || Object.entries(taskWorkspaceOwner).some(([key, value]) => owner[key] !== value))) {
+      throw new WorkspaceValidationFailure("The retained workspace belongs to a different agent or plugin environment.",
+        { reason: "plugin_workspace_owner_mismatch" });
+    }
+  }
+  const workspaceServices = parseObject(mergedConfig.workspaceRuntime).services;
+  if (pluginTaskWorkspace && Array.isArray(workspaceServices) && workspaceServices.length > 0) {
+    throw new WorkspaceValidationFailure("The selected plugin environment does not support Core workspace services.",
+      { reason: "plugin_workspace_services_unsupported" });
+  }
   const {
     selectedEnvironmentDriver: lowTrustPreflightEnvironmentDriver,
     workspace: resolvedWorkspace,
@@ -822,6 +837,7 @@ async function prepareHeartbeatWorkspaceLocked(db: Db, input: HeartbeatWorkspace
   const nextExecutionWorkspaceMetadata = {
     ...baseExecutionWorkspaceMetadata,
     ...(pluginPrepared?.metadata ?? {}),
+    ...(taskWorkspaceOwner && !pluginPrepared ? { runnerTaskWorkspaceOwner: taskWorkspaceOwner } : {}),
     ...(copyOnlyProvisioning ? { [CONTROLLER_PROVISION_COPY_ONLY]: true } : {}),
     ...(persistedWorktreeInstanceRoot
       ? {
@@ -1192,7 +1208,8 @@ async function prepareHeartbeatWorkspaceLocked(db: Db, input: HeartbeatWorkspace
   const workspaceRealization = realizationResult.workspaceRealization;
   const executionTarget = realizationResult.executionTarget;
   if (!pluginPrepared && !pluginTaskWorkspace && !isDotRun && issueId && (persistedNativeExecutionInput || nativeRecoveryExecutionWorkspaceId)
-      && !(executionTarget?.kind === "remote" && executionTarget.transport === "ssh")) {
+      && !(executionTarget?.kind === "remote" && (executionTarget.transport === "ssh"
+        || (executionTarget.transport === "sandbox" && executionTarget.runnerTask)))) {
     const workspaceId = persistedNativeExecutionInput?.binding.executionWorkspaceId ?? nativeRecoveryExecutionWorkspaceId!;
     const reference = readNativeWorkspaceSyncReference(parseObject(run.runnerProfileJson).nativeWorkspaceSync);
     if (!reference && executionTarget?.kind === "remote" && executionTarget.transport === "sandbox") {

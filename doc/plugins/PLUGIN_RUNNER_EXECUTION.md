@@ -22,8 +22,15 @@ operation. Use a separate workflow to install and save agent files.
 Core supports per-turn workspace sessions with Codex, OpenCode, and ACPX.
 OpenCode and ACPX require the existing qualified provider profiles.
 Workspace-free providers and warm process retention are not supported here.
-The plugin owns project workspace preparation. Core Git worktree preparation
-and reuse of a Core Git worktree are not supported.
+The plugin owns project workspace preparation. Core does not prepare or reuse
+a Core Git worktree for a task-only environment.
+For plugin-backed project storage, Core uses the workspace provider contract.
+The storage plugin must also provide the selected execution environment.
+Its declared workspace modes and strategies remain in effect.
+Core passes the pinned workspace binding with each task operation.
+Core rejects configured workspace services for task-only environments.
+An agent-owned workspace cannot move to another agent or environment.
+Keep its original owner, or use the workspace storage provider contract.
 
 ## Prepare and launch
 
@@ -57,7 +64,7 @@ skills=/home/agent/.agents/skills/<name>/SKILL.md
 ```
 
 These are execution-host locations. Core does not copy the home for each run.
-For a managed account, the plugin must declare `projectAuthCheckVersion: 1`.
+The plugin must declare `projectAuthCheckVersion: 1` for all native tasks.
 Core requires `check_project_auth` to allow the exact prepared configuration
 before it sends credentials. The plugin must reject conflicting project or
 parent authentication settings. It must keep the checked configuration fixed
@@ -112,6 +119,8 @@ It runs the same describe, prepare, submit, and WSS/PRP path.
 The probe checks provider authentication and the selected model with tools denied.
 Core bounds Runner lifetime to the remaining probe time.
 It then requires suspension, confirmed termination, and task cleanup.
+For a new agent-owned computer, the saved-agent lifecycle runs verification
+after it saves the agent. Core does not require a computer before this save.
 
 ## Verification
 
