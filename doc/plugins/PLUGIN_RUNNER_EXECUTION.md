@@ -29,6 +29,7 @@ The storage plugin must also provide the selected execution environment.
 Its declared workspace modes and strategies remain in effect.
 Core passes the pinned workspace binding with each task operation.
 Core rejects configured workspace services for task-only environments.
+Fresh retries that import retained files are not supported for plugin storage.
 An agent-owned workspace cannot move to another agent or environment.
 Keep its original owner, or use the workspace storage provider contract.
 

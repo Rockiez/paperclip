@@ -410,15 +410,19 @@ describe.skipIf(!support.supported)("heartbeat workspace preparation boundary", 
     expect(realize).toHaveBeenCalledTimes(2);
   });
 
-  it("rejects configured Core services before plugin workspace preparation or acquisition", async () => {
+  it.each(["services", "fresh"] as const)("rejects unsupported %s before plugin workspace preparation or acquisition", async mode => {
     const { input, envOrchestrator } = await fixture();
     input.agent.adapterType = "paperclip_runner";
     input.environment.selectedEnvironmentForConfig = { ...input.environment.localEnvironment, driver: "plugin" };
-    input.config.mergedConfig.workspaceRuntime = { services: [{ name: "preview", command: "must-not-run-on-core" }] };
+    if (mode === "services") input.config.mergedConfig.workspaceRuntime = { services: [{ name: "preview", command: "must-not-run-on-core" }] };
+    else input.task.freshWorkspace = { mode: "fresh_isolated_workspace", retryIntentId: input.run.id,
+      sourceRunId: input.run.id, retainedSourceIds: [] };
     const acquire = vi.spyOn(envOrchestrator, "acquireForRun");
+    const resolve = vi.spyOn(input.services, "resolveWorkspaceForRun");
     await expect(prepareHeartbeatWorkspace(db, input)).rejects.toMatchObject({
-      resultJson: { reason: "plugin_workspace_services_unsupported" },
+      resultJson: { reason: mode === "services" ? "plugin_workspace_services_unsupported" : "fresh_workspace_storage_unsupported" },
     });
+    expect(resolve).not.toHaveBeenCalled();
     expect(acquire).not.toHaveBeenCalled();
   });
 

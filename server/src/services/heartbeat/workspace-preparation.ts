@@ -216,6 +216,10 @@ async function prepareHeartbeatWorkspaceLocked(db: Db, input: HeartbeatWorkspace
     appendRunEvent,
   } = input.services;
   const pluginTaskWorkspace = selectedEnvironmentForConfig?.driver === "plugin" && agent.adapterType === "paperclip_runner";
+  if (fresh && !isDotRun && pluginTaskWorkspace) {
+    throw new WorkspaceValidationFailure("A fresh attempt is unavailable for this workspace storage provider. The existing workspace is retained.",
+      { reason: "fresh_workspace_storage_unsupported" });
+  }
   const pluginConfig = parseObject(selectedEnvironmentForConfig?.config);
   const taskWorkspaceOwner = pluginTaskWorkspace ? { agentId: agent.id, environmentId: selectedEnvironmentForConfig.id,
     pluginKey: pluginConfig.pluginKey ?? null, driverKey: pluginConfig.driverKey ?? null } : null;
