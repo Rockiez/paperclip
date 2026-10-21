@@ -44,6 +44,7 @@ export type CancelStaleQueuedRunInput = {
 export type DispatchResolvedInteractionInput<T> = CancelStaleQueuedRunInput & {
   reservationId: string;
   recoveryLeaseOwner?: string;
+  enforceContinuationOwnership?: boolean;
   dispatch: (markDispatchStarted: () => void) => Promise<T>;
 };
 

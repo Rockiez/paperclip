@@ -2753,8 +2753,8 @@ export function heartbeatService(
         { dispatched: true; resultPromise: Promise<T> } | { dispatched: false }
       > => {
         await controllerLease.assertOwned("dispatching");
-        // Recheck after preparation. The final locked gate protects synchronous
-        // handoff and commits before waiting for adapter bootstrap or execution.
+        // Recheck after preparation. The final locked gate commits a dispatch
+        // claim before entering adapter bootstrap or contacting a provider.
         await authorizeFailedChatRetryExecution();
         if (
           !(await withChatControlRecoveryGate(
@@ -2780,9 +2780,10 @@ export function heartbeatService(
           }
           return { dispatched: false };
         }
-        if (issueId && (isResolvedInteractionContinuationWakeContext(context) ||
+        const enforceContinuationOwnership = Boolean(issueId && (isResolvedInteractionContinuationWakeContext(context) ||
           typeof context.workspaceReconstructionActionId === "string" ||
-          ["native_safe_replacement", "native_provider_overloaded"].includes(run.scheduledRetryReason ?? ""))) {
+          ["native_safe_replacement", "native_provider_overloaded"].includes(run.scheduledRetryReason ?? "")));
+        if (issueId && enforceContinuationOwnership) {
           await options.beforeResolvedInteractionContinuationDispatchCheck?.({ runId: run.id, issueId });
           await options.afterResolvedInteractionContinuationDispatchCheck?.({ runId: run.id, issueId });
         }
@@ -2791,9 +2792,10 @@ export function heartbeatService(
           companyId: run.companyId,
           expectedStatus: "running",
           reservationId: reservation.id,
-          ...(reservation.reused ? { recoveryLeaseOwner: runOptions.nativeLeaseOwner } : {}),
-          // Synchronous handoff under the ownership lock; the gate commits
-          // without awaiting the adapter's asynchronous bootstrap or finalizer.
+          enforceContinuationOwnership,
+          ...(runOptions.nativeLeaseOwner ? { recoveryLeaseOwner: runOptions.nativeLeaseOwner } : {}),
+          // The gate persists admission under the ownership lock, then invokes
+          // this callback after commit so provider I/O holds no accounting lock.
           dispatch,
         });
 

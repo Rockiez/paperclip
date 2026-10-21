@@ -7,9 +7,23 @@ import { budgetServiceInTransaction } from "./budgets.js";
 import { withBudgetSpan } from "./budget-tracing.js";
 import type { ActivityPublication } from "./activity-log.js";
 
+/** Native finalization takes its coordinator before issue/run locks. Recovery
+ * admission uses the same order after the company accounting lock, so its
+ * later ownership checks never wait for a coordinator while holding a run. */
+export async function lockRunBudgetRecoveryOwnerInTransaction(
+  tx: Db, companyId: string, runId: string, recoveryLeaseOwner?: string,
+) {
+  if (!recoveryLeaseOwner) return;
+  const [coordinator] = await tx.select({ leaseOwner: nativeRunFinalizations.leaseOwner, leaseExpiresAt: nativeRunFinalizations.leaseExpiresAt }).from(nativeRunFinalizations)
+    .where(and(eq(nativeRunFinalizations.companyId, companyId), eq(nativeRunFinalizations.runId, runId))).for("update");
+  if (!coordinator || coordinator.leaseOwner !== recoveryLeaseOwner || !coordinator.leaseExpiresAt || coordinator.leaseExpiresAt.getTime() <= Date.now())
+    throw conflict("Native recovery no longer owns provider dispatch");
+}
+
 /** Called by the final dispatch gate with the company and run already locked.
  * Admission may have waited through preparation; that earlier reservation is
- * evidence of ownership, not permission to bypass a newer charge or pause. */
+ * evidence of ownership, not permission to bypass a newer charge or pause.
+ * Recovery callers prelock their coordinator before taking issue/run locks. */
 export async function recheckRunBudgetReservationInTransaction(
   tx: Db,
   publications: ActivityPublication[],
@@ -31,7 +45,7 @@ export async function recheckRunBudgetReservationInTransaction(
     const [owner] = run.runtimeMode === "native" ? await tx.select({ runId: nativeRunFinalizations.runId })
       .from(nativeRunFinalizations).where(and(eq(nativeRunFinalizations.companyId, run.companyId),
         eq(nativeRunFinalizations.runId, run.id), eq(nativeRunFinalizations.leaseOwner, recoveryLeaseOwner),
-        sql`${nativeRunFinalizations.leaseExpiresAt} > now()`)).for("update") : [];
+        sql`${nativeRunFinalizations.leaseExpiresAt} > clock_timestamp()`)) : [];
     if (!owner) return "Native recovery no longer owns provider dispatch";
   }
   const { block, policies, observations } = await budgetServiceInTransaction(tx, publications)
@@ -58,6 +72,7 @@ export async function recheckRunBudgetReservationInTransaction(
  * A reservation survives timeouts and restarts until accounting proves closure. */
 export async function reserveRunBudget(db: Db, companyId: string, runId: string, projectId: string | null, ledgerScope: Record<string, unknown> = {}, recoveryLeaseOwner?: string) {
   const result = await withBudgetSpan("budget.admission.reserve", () => withAccountingTransaction(db, companyId, async (tx, publications) => {
+    await lockRunBudgetRecoveryOwnerInTransaction(tx, companyId, runId, recoveryLeaseOwner);
     const [run] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.companyId, companyId))).for("update");
     if (!run) throw notFound("Run not found");
     if (run.resultJson?.cancellation || run.resultJson?.startupCancellation) throw conflict("Run cancellation already requested");
@@ -70,7 +85,7 @@ export async function reserveRunBudget(db: Db, companyId: string, runId: string,
         && existing.projectId === projectId ? await tx.select({ runId: nativeRunFinalizations.runId })
           .from(nativeRunFinalizations).where(and(eq(nativeRunFinalizations.companyId, companyId),
             eq(nativeRunFinalizations.runId, runId), eq(nativeRunFinalizations.leaseOwner, recoveryLeaseOwner),
-            sql`${nativeRunFinalizations.leaseExpiresAt} > now()`)).for("update") : [];
+            sql`${nativeRunFinalizations.leaseExpiresAt} > clock_timestamp()`)) : [];
       if (owner) {
         // Recovery has already made this run queued/running, so its own pending
         // accounting is excluded. Current overruns, other unfinished runs and
