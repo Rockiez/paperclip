@@ -61,7 +61,7 @@ or unavailable cost data without treating missing data as zero spend.
 
 Automated: [budget service](../../server/src/__tests__/budgets-service.test.ts) exercises soft incidents, hard stops, scope, and valid budget raises.
 
-Automated: [scoped budget accounting](../../server/src/__tests__/budget-enforcement-scoping.test.ts) exercises cumulative running usage, reservation capacity, final settlement, project isolation, and concurrent admission. [Run control](../../server/src/services/heartbeat/run-control.test.ts) exercises durable scoped cancellation, delayed providers, stale generations, and recovery. These controlled-provider tests establish enforcement semantics, not live provider termination latency.
+Automated: [scoped budget accounting](../../server/src/__tests__/budget-enforcement-scoping.test.ts) exercises cumulative running usage, reservation capacity, final settlement, project isolation, and concurrent admission. [Budget cancellation](../../server/src/services/heartbeat/budget-cancellation.test.ts) exercises durable scoped cancellation, delayed providers, stale generations, and recovery. These controlled-provider tests establish enforcement semantics, not live provider termination latency.
 
 Automated: [hosted browser accounting](../../server/src/__tests__/browser-use-connection.test.ts) covers separate browser holds, concurrent starts, final dispatch races, unknown POST outcomes, and exact terminal settlement. Browser caps reserve additional capacity alongside the parent run; internal holds are never returned as provider results.
 
