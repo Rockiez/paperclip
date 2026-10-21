@@ -10,14 +10,27 @@ export async function readNativeContinuationSource(
   binding: { companyId: string; issueId: string; runId: string },
 ): Promise<string | null> {
   const source = alias(heartbeatRuns, "continuation_source");
+  const dispatch = alias(agentWakeupRequests, "continuation_dispatch");
   const sources = await db.select({ runId: source.id }).from(heartbeatRuns)
     .innerJoin(agentWakeupRequests, and(
       eq(agentWakeupRequests.companyId, binding.companyId),
       eq(agentWakeupRequests.runId, heartbeatRuns.id),
       eq(agentWakeupRequests.agentId, heartbeatRuns.agentId),
       eq(agentWakeupRequests.reason, "issue_status_changed"),
-      inArray(agentWakeupRequests.status, ["claimed", "completed"]),
+      eq(agentWakeupRequests.status, "coalesced"),
+      eq(agentWakeupRequests.requestedByActorType, "system"),
+      eq(agentWakeupRequests.requestedByActorId, "native-status-committer"),
       sql`${agentWakeupRequests.payload}->>'issueId' = ${binding.issueId}`,
+      sql`${heartbeatRuns.contextSnapshot}->>'nativeStatusWakeIntentId' = ${agentWakeupRequests.id}::text`,
+    ))
+    .innerJoin(dispatch, and(
+      eq(dispatch.companyId, binding.companyId), eq(dispatch.agentId, heartbeatRuns.agentId),
+      eq(dispatch.runId, heartbeatRuns.id), eq(dispatch.reason, "issue_status_changed"),
+      eq(dispatch.requestedByActorType, "system"),
+      sql`${dispatch.requestedByActorId} = 'native-status-wake-dispatch:' || ${agentWakeupRequests.id}::text`,
+      eq(dispatch.idempotencyKey, agentWakeupRequests.idempotencyKey),
+      inArray(dispatch.status, ["queued", "claimed", "completed", "coalesced"]),
+      sql`${dispatch.payload}->>'issueId' = ${binding.issueId}`,
     ))
     .innerJoin(statusDecisionEffects, and(
       eq(statusDecisionEffects.companyId, binding.companyId), eq(statusDecisionEffects.issueId, binding.issueId),

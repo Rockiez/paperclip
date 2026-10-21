@@ -757,7 +757,7 @@ export async function enqueueChatRunMilestones(
         and continuation_wake.run_id = ${heartbeatRuns.id}
         and continuation_wake.agent_id = ${heartbeatRuns.agentId}
         and continuation_wake.reason = 'issue_status_changed'
-        and continuation_wake.status in ('claimed', 'completed')
+        and continuation_wake.status in ('queued', 'claimed', 'completed', 'coalesced')
         and continuation_wake.payload->>'issueId' = ${issueIdFromContext}
     )
   )`;

@@ -3,7 +3,7 @@ import { and, eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   agents, agentWakeupRequests, authUsers, chatConversations, chatEndpoints, chatMessageLinks,
-  chatPublications, companies, completionContracts, createDb, heartbeatRuns, issueComments, issues, nativeRunFinalizations, nativeRunResults,
+  chatPublications, companies, companyMemberships, completionContracts, createDb, heartbeatRuns, issueComments, issues, nativeRunFinalizations, nativeRunResults,
   statusDecisions, statusDecisionEffects, toolApplications, toolConnections,
 } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../__tests__/helpers/embedded-postgres.js";
@@ -12,6 +12,9 @@ import { CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON } from "./heartbeat-run-summ
 import { resolveChatOriginPublicationBindings } from "./issues.js";
 import { NativeRunCoordinatorStore } from "./native-runtime/native-run-coordinator-store.js";
 import { finalizeNativeRun, repairCommittedNativeChatResponse } from "./native-runtime/native-run-finalizer.js";
+import { createHeartbeatQueueTestDependencies } from "../__tests__/helpers/heartbeat-queue.js";
+import { createHeartbeatQueue } from "./heartbeat/queue.js";
+import { instanceSettingsService } from "./instance-settings.js";
 
 const support = await getEmbeddedPostgresTestSupport();
 if (!support.supported) console.warn(`Monitor publication database unavailable: ${support.reason}`);
@@ -27,8 +30,9 @@ if (!support.supported) console.warn(`Monitor publication database unavailable: 
 
   async function fixture() {
     const [company] = await db.insert(companies).values({ name: "Continuation", issuePrefix: randomUUID().slice(0, 8) }).returning();
+    await db.insert(companyMemberships).values({ companyId: company.id, principalType: "user", principalId: "requester", status: "active", membershipRole: "owner" });
     const [agent] = await db.insert(agents).values({ companyId: company.id, name: "Worker", adapterType: "paperclip_runner" }).returning();
-    const [issue] = await db.insert(issues).values({ companyId: company.id, title: "Repository QA", status: "in_progress", assigneeAgentId: agent.id }).returning();
+    const [issue] = await db.insert(issues).values({ companyId: company.id, title: "Repository QA", status: "in_progress", assigneeAgentId: agent.id, responsibleUserId: "requester" }).returning();
     const [application] = await db.insert(toolApplications).values({ companyId: company.id, applicationKey: randomUUID(), name: "Slack", type: "chat" }).returning();
     const [connection] = await db.insert(toolConnections).values({ companyId: company.id, applicationId: application.id, name: "Slack", uid: randomUUID(), connectionPurpose: "channel", transport: "chat_sdk" }).returning();
     const [endpoint] = await db.insert(chatEndpoints).values({ companyId: company.id, connectionId: connection.id, provider: "slack", publicId: randomUUID(), assignedAgentId: agent.id, status: "active" }).returning();
@@ -161,11 +165,21 @@ if (!support.supported) console.warn(`Monitor publication database unavailable: 
     await finalizeNativeRun({ db, runId: f.source.id, workspaceFinalizeStatus: "succeeded", projectRunStatus: true });
     const [wake] = await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, f.company.id), eq(agentWakeupRequests.reason, "issue_status_changed")));
     expect(wake).toBeDefined();
-    await db.update(agentWakeupRequests).set({ status: "claimed", runId: f.successor.id }).where(eq(agentWakeupRequests.id, wake.id));
-    await db.update(heartbeatRuns).set({ status: "running", finishedAt: null,
-      contextSnapshot: { source: "native_status_decision", issueId: f.issue.id },
-    }).where(eq(heartbeatRuns.id, f.successor.id));
-    return { ...f, continuationWake: wake, summary };
+    const deps = createHeartbeatQueueTestDependencies(db);
+    deps.getAgent.mockImplementation(async id => (await db.select().from(agents).where(eq(agents.id, id)))[0] ?? null);
+    deps.instanceSettings.getExperimental.mockImplementation(() => instanceSettingsService(db).getExperimental());
+    await db.update(agents).set({ runtimeConfig: { heartbeat: { wakeOnDemand: true } } }).where(eq(agents.id, f.agent.id));
+    const queue = createHeartbeatQueue(db, deps);
+    expect(await queue.dispatchPendingNativeStatusWakeups({ companyId: f.company.id })).toMatchObject({ dispatched: 1 });
+    await queue.startNextQueuedRunForAgent(f.agent.id);
+    await Promise.all([...deps.activeRunExecutionPromises]);
+    const [delivered] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wake.id));
+    expect(delivered).toMatchObject({ status: "coalesced" });
+    expect(delivered.runId).toBeTruthy();
+    const [successor] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, delivered.runId!));
+    expect(successor.responsibleUserId).toBe("requester");
+    return { ...f, successor, continuationWake: delivered, summary,
+      bindings: (runId = successor.id) => resolveChatOriginPublicationBindings(db, f.company.id, f.issue.id, runId) };
   }
 
   it("delivers the saved setup explanation and retains chat through the committed automatic continuation", async () => {
@@ -182,11 +196,13 @@ if (!support.supported) console.warn(`Monitor publication database unavailable: 
     expect(await db.select().from(nativeRunResults).where(eq(nativeRunResults.runId, f.source.id))).toHaveLength(1);
   });
 
-  it.each(["effect", "decision", "wake", "requester", "agent"])("rejects automatic continuation when %s authority is no longer valid", async fault => {
+  it.each(["effect", "decision", "wake", "dispatch", "requester", "agent"])("rejects automatic continuation when %s authority is no longer valid", async fault => {
     const f = await continuedTaskFixture();
     if (fault === "effect") await db.update(statusDecisionEffects).set({ targetId: randomUUID() }).where(eq(statusDecisionEffects.companyId, f.company.id));
     if (fault === "decision") await db.update(statusDecisions).set({ applicationState: "proposed" }).where(eq(statusDecisions.companyId, f.company.id));
     if (fault === "wake") await db.update(agentWakeupRequests).set({ idempotencyKey: randomUUID() }).where(eq(agentWakeupRequests.id, f.continuationWake.id));
+    if (fault === "dispatch") await db.update(agentWakeupRequests).set({ requestedByActorId: "unrelated-dispatch" }).where(and(
+      eq(agentWakeupRequests.companyId, f.company.id), eq(agentWakeupRequests.requestedByActorId, `native-status-wake-dispatch:${f.continuationWake.id}`)));
     if (fault === "requester") await db.update(heartbeatRuns).set({ responsibleUserId: "another-person" }).where(eq(heartbeatRuns.id, f.successor.id));
     if (fault === "agent") {
       const [other] = await db.insert(agents).values({ companyId: f.company.id, name: "Other", adapterType: "paperclip_runner" }).returning();
