@@ -205,6 +205,7 @@ export function isExternalChatPresentationContext(
   if (
     source === "tool_action_review" ||
     source === "issue.monitor" ||
+    source === "native_status_decision" ||
     source.startsWith("issue.comment") ||
     source === "issue.update"
   )
@@ -285,16 +286,18 @@ function hasYieldedSemanticResult(resultJson: Record<string, unknown>) {
   );
 }
 
-export function readAcceptedMonitorContinuationSummary(
+export function readAcceptedTaskContinuationSummary(
   resultJson: Record<string, unknown> | null | undefined,
 ): string | null {
   const result = record(resultJson);
-  if (result.finalizationPhase !== "committed" ||
-      !["scheduled_monitor_waiting", "scheduled_monitor_dispatched"].includes(String(result.finalizationReasonCode))) return null;
+  if (result.finalizationPhase !== "committed") return null;
+  const kind = result.finalizationReasonCode === "live_continuation_registered" ? "same_agent"
+    : ["scheduled_monitor_waiting", "scheduled_monitor_dispatched"].includes(String(result.finalizationReasonCode)) ? "monitor" : null;
+  if (!kind) return null;
   for (const candidate of semanticResultCandidates(result)) {
     const continuation = record(candidate.continuation);
     if (candidate.schema === "paperclip.run_result.v1" && candidate.reportedWorkDisposition === "yielded" &&
-        continuation.kind === "monitor" && readCommentText(continuation.idempotencyKey)) {
+        continuation.kind === kind && readCommentText(continuation.idempotencyKey)) {
       return readCommentText(candidate.summary);
     }
   }
@@ -411,20 +414,21 @@ export function resolveHeartbeatRunResponse(input: {
   } | null;
 }): ResolvedHeartbeatRunResponse {
   const resultJson = record(input.resultJson);
-  const monitorSummary = readAcceptedMonitorContinuationSummary(resultJson);
-  if (monitorSummary) {
+  const continuationSummary = readAcceptedTaskContinuationSummary(resultJson);
+  if (continuationSummary) {
     if (input.interactionOwnsResponse) return {
       text: null,
       decision: decision("none", { commentAction: "none", reasonCodes: ["interaction_owns_response"] }),
     };
     const existing = input.existingComment;
-    const reuse = existing?.body === monitorSummary;
+    const reuse = existing?.body === continuationSummary;
     return {
-      text: monitorSummary,
+      text: continuationSummary,
       decision: decision("semantic_result_summary", {
         commentAction: reuse ? "reuse" : "create",
         ...(reuse ? { commentId: existing.id } : {}),
-        reasonCodes: ["accepted_scheduled_monitor_summary"],
+        reasonCodes: [resultJson.finalizationReasonCode === "live_continuation_registered"
+          ? "accepted_task_continuation_summary" : "accepted_scheduled_monitor_summary"],
       }),
     };
   }

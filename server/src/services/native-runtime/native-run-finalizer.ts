@@ -68,7 +68,7 @@ import {
   CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON,
   findHeartbeatRunCompletionComment,
   isExternalChatPresentationContext,
-  readAcceptedMonitorContinuationSummary,
+  readAcceptedTaskContinuationSummary,
   readCompletedAssistantMessageCandidate,
   resolveHeartbeatRunResponse,
   selectHeartbeatRunFinalAgentMessage,
@@ -964,7 +964,7 @@ export async function repairCommittedNativeChatResponse(
       if (record(decision.decisionJson).externalChatReviewPresentation)
         return false;
       const monitorResult = { nativeResult: result, finalizationPhase: "committed", finalizationReasonCode: decision.reasonCode };
-      if (readAcceptedMonitorContinuationSummary(monitorResult) && run.status === "succeeded" &&
+      if (readAcceptedTaskContinuationSummary(monitorResult) && run.status === "succeeded" &&
           terminal.runTerminalState === "succeeded" && terminal.turnTerminalState === "completed" &&
           terminal.reportedWorkDisposition === "yielded" && record(run.contextSnapshot).skipIssueComment !== true &&
           !await hasChatRunOwnedProviderInteraction(tx, input)) {

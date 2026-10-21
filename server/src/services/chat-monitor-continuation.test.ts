@@ -4,7 +4,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   agents, agentWakeupRequests, authUsers, chatConversations, chatEndpoints, chatMessageLinks,
   chatPublications, companies, completionContracts, createDb, heartbeatRuns, issueComments, issues, nativeRunFinalizations, nativeRunResults,
-  toolApplications, toolConnections,
+  statusDecisions, statusDecisionEffects, toolApplications, toolConnections,
 } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../__tests__/helpers/embedded-postgres.js";
 import { enqueueChatRunMilestones, resolveChatRunPresentationAuthorizationReason } from "./chat-run-publications.js";
@@ -131,6 +131,68 @@ if (!support.supported) console.warn(`Monitor publication database unavailable: 
     } }).where(eq(heartbeatRuns.id, f.source.id));
     await enqueueChatRunMilestones(db);
     expect(await db.select().from(chatPublications).where(and(eq(chatPublications.issueId, f.issue.id), eq(chatPublications.idempotencyKey, `run:${f.source.id}:completed:${f.endpoint.id}`)))).toEqual([]);
+  });
+
+  async function continuedTaskFixture() {
+    const f = await fixture();
+    const [contract] = await db.insert(completionContracts).values({ companyId: f.company.id, issueId: f.issue.id,
+      revision: 1, schemaVersion: "paperclip.completion-contract.v1", policyVersion: "test", risk: "standard",
+      completionAuthority: "server_arbiter", incompleteCriteriaPolicy: "preserve_non_terminal",
+      contractJson: { revision: "test", objective: "Verify repository migration", criteria: [] }, canonicalSha256: "workspace-contract",
+      createdByActorType: "system", createdByActorId: "test",
+    }).returning();
+    const sessionId = randomUUID(), runnerId = randomUUID();
+    await db.update(heartbeatRuns).set({ status: "running", nativeSessionId: sessionId, runnerInstanceId: runnerId,
+      completionContractId: contract.id, completionContractSha256: contract.canonicalSha256,
+    }).where(eq(heartbeatRuns.id, f.source.id));
+    await db.update(issues).set({ executionRunId: f.source.id }).where(eq(issues.id, f.issue.id));
+    await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date() }).where(eq(heartbeatRuns.id, f.successor.id));
+    const port = new NativeRunCoordinatorStore(db, { companyId: f.company.id, issueId: f.issue.id,
+      runId: f.source.id, agentId: f.agent.id, normalizedSessionId: sessionId, completionContractId: contract.id,
+      completionContractSha256: contract.canonicalSha256, runnerSourceInstanceId: runnerId,
+      completionContractRevision: "test", completionContractCriterionIds: [],
+    });
+    const summary = "The repository is staged. I will continue QA automatically when it is prepared.";
+    await port.completeRun({ result: { schema: "paperclip.run_result.v1", reportedWorkDisposition: "yielded", summary,
+      completionClaim: { contractRevision: "test", objectiveSatisfied: false, criteria: [], remainingWork: [{ description: "Complete QA", blocksCompletion: true }] },
+      continuation: { kind: "same_agent", summary: "Continue QA with the prepared checkout", idempotencyKey: "repository-admission" },
+      evidence: [], verification: [], attentionRequests: [], artifacts: [],
+    }, terminal: { schema: "paperclip.prp.terminal.v1", runTerminalState: "succeeded", turnTerminalState: "completed", reportedWorkDisposition: "yielded" }, turnId: "prepare-turn" });
+    await finalizeNativeRun({ db, runId: f.source.id, workspaceFinalizeStatus: "succeeded", projectRunStatus: true });
+    const [wake] = await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, f.company.id), eq(agentWakeupRequests.reason, "issue_status_changed")));
+    expect(wake).toBeDefined();
+    await db.update(agentWakeupRequests).set({ status: "claimed", runId: f.successor.id }).where(eq(agentWakeupRequests.id, wake.id));
+    await db.update(heartbeatRuns).set({ status: "running", finishedAt: null,
+      contextSnapshot: { source: "native_status_decision", issueId: f.issue.id },
+    }).where(eq(heartbeatRuns.id, f.successor.id));
+    return { ...f, continuationWake: wake, summary };
+  }
+
+  it("delivers the saved setup explanation and retains chat through the committed automatic continuation", async () => {
+    const f = await continuedTaskFixture();
+    expect(await db.select({ body: issueComments.body }).from(issueComments).where(eq(issueComments.createdByRunId, f.source.id)))
+      .toEqual([{ body: f.summary }]);
+    expect(await f.bindings()).toEqual(await f.bindings(f.source.id));
+    expect(await f.bindings()).toHaveLength(1);
+    await enqueueChatRunMilestones(db);
+    const publications = await db.select().from(chatPublications).where(eq(chatPublications.issueId, f.issue.id));
+    expect(publications.some(p => p.payload.text === f.summary && p.conversationId === f.conversation.id)).toBe(true);
+    expect(publications.some(p => p.payload.progressState === "working" && p.conversationId === f.conversation.id)).toBe(true);
+    expect(await repairCommittedNativeChatResponse(db, { companyId: f.company.id, issueId: f.issue.id, runId: f.source.id })).toBe(false);
+    expect(await db.select().from(nativeRunResults).where(eq(nativeRunResults.runId, f.source.id))).toHaveLength(1);
+  });
+
+  it.each(["effect", "decision", "wake", "requester", "agent"])("rejects automatic continuation when %s authority is no longer valid", async fault => {
+    const f = await continuedTaskFixture();
+    if (fault === "effect") await db.update(statusDecisionEffects).set({ targetId: randomUUID() }).where(eq(statusDecisionEffects.companyId, f.company.id));
+    if (fault === "decision") await db.update(statusDecisions).set({ applicationState: "proposed" }).where(eq(statusDecisions.companyId, f.company.id));
+    if (fault === "wake") await db.update(agentWakeupRequests).set({ idempotencyKey: randomUUID() }).where(eq(agentWakeupRequests.id, f.continuationWake.id));
+    if (fault === "requester") await db.update(heartbeatRuns).set({ responsibleUserId: "another-person" }).where(eq(heartbeatRuns.id, f.successor.id));
+    if (fault === "agent") {
+      const [other] = await db.insert(agents).values({ companyId: f.company.id, name: "Other", adapterType: "paperclip_runner" }).returning();
+      await db.update(heartbeatRuns).set({ agentId: other.id }).where(eq(heartbeatRuns.id, f.source.id));
+    }
+    expect(await f.bindings()).toEqual([]);
   });
 
   it("recovers the accepted continuation explanation after interrupted finalization without another provider result", async () => {
