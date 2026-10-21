@@ -75,7 +75,8 @@ const terminalSessions = ["closed", "failed"];
 const liveSessions = ["starting", "running", "idle", "stopping"];
 const requestMarker = (invocationId: string) => `\n\n[Paperclip request: ${invocationId}]`;
 type BrowserBudgetHold = { invocationId: string; amountCents: string; projectId: string | null;
-  state: "held" | "released" | "settled"; dispatchCommittedAt?: string; accountedCentsExact?: string; billingUnknown?: boolean };
+  state: "held" | "released" | "settled"; uncapped?: boolean;
+  dispatchCommittedAt?: string; accountedCentsExact?: string; billingUnknown?: boolean };
 const resultObject = (value: unknown): Record<string, unknown> =>
   value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
 const budgetHold = (value: unknown) => resultObject(value).paperclipBudgetHold as BrowserBudgetHold | undefined;
@@ -548,7 +549,8 @@ export function browserUseService(
           })
           .returning();
       }
-      const hold: BrowserBudgetHold = { invocationId, amountCents: check.amountCents!, projectId: check.projectId!, state: "held" };
+      const hold: BrowserBudgetHold = { invocationId, amountCents: check.amountCents!, projectId: check.projectId!,
+        state: "held", uncapped: check.maxCostUsd === undefined };
       await tx.insert(runs).values({
         result: { paperclipBudgetHold: hold },
         companyId: binding.companyId,

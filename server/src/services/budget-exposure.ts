@@ -1,6 +1,6 @@
 import { addCents, normalizeCents, usdToUnits, unitsToCents } from "@paperclipai/shared";
 import { and, eq, gte, inArray, lt, or, sql, type SQL } from "drizzle-orm";
-import { budgetPolicies, budgetReservations, browserUseRuns, browserUseSessions, costEvents, heartbeatRuns, nativeRunFinalizations, type Db } from "@paperclipai/db";
+import { budgetPolicies, budgetReservations, browserUseRuns, browserUseSessions, costEvents, heartbeatRuns, issues, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import { withBudgetSpan } from "./budget-tracing.js";
 
 export interface BudgetExposure {
@@ -9,7 +9,7 @@ export interface BudgetExposure {
   effectiveHeldCents: string;
   pendingTerminalRunCount: number;
   unpricedEventCount: number;
-  /** Unconfirmed hosted browser POSTs, separate from ledger data quality. */
+  /** Unconfirmed POSTs or unfinished uncapped browser work, separate from ledger data quality. */
   unknownBrowserRunCount: number;
 }
 
@@ -87,14 +87,29 @@ async function readObservedSpends(db: Db, policies: SpendPolicy[], now: Date): P
     // Hosted browser work is a separate paid operation from its parent run.
     // Its durable hold survives unknown POST outcomes and monthly rollover.
     const browserHold = sql`${browserUseRuns.result}->'paperclipBudgetHold'`;
+    const hasBrowserHold = sql`coalesce(jsonb_typeof(${browserHold}) = 'object'
+      and ${browserHold}->>'invocationId' = ${browserUseRuns.invocationId}::text, false)`;
+    // Earlier browser rows did not persist a cap/dispatch projection. Their
+    // unfinished work remains unknown until a terminal receipt is accounted.
+    const legacyBrowserPending = sql`not ${hasBrowserHold} and ${browserUseRuns.eventsDrained} = 0
+      and (${browserUseRuns.providerRunId} is not null or ${browserUseRuns.status} in ('creating', 'unknown', 'queued', 'dispatching', 'running'))`;
     const browser = and(eq(browserUseRuns.companyId, policy.companyId), eq(browserUseSessions.companyId, policy.companyId),
-      sql`${browserHold}->>'state' = 'held'`,
-      sql`${browserHold}->>'invocationId' = ${browserUseRuns.invocationId}::text`,
+      sql`((${hasBrowserHold} and ${browserHold}->>'state' = 'held') or (${legacyBrowserPending}))`,
       policy.scopeType === "agent" ? eq(browserUseSessions.agentId, policy.scopeId) : undefined,
-      policy.scopeType === "project" ? sql`${browserHold}->>'projectId' = ${policy.scopeId}` : undefined)!;
+      policy.scopeType === "project" ? sql`case when ${hasBrowserHold} then ${browserHold}->>'projectId'
+        else ${issues.projectId}::text end = ${policy.scopeId}` : undefined)!;
     browserPredicates.push(browser);
     browserColumns[`held${index}`] = sql`coalesce(sum(${normalizedNumericCents(sql`${browserHold}->>'amountCents'`)}) filter (where ${browser}), 0)::text`;
-    browserColumns[`unknown${index}`] = sql`count(*) filter (where ${browser} and ${browserHold}->>'billingUnknown' = 'true')::int`;
+    // A successful uncapped POST still has no bounded monetary exposure until
+    // terminal accounting. Introducing a budget cannot treat that work as free.
+    // Older holds had no explicit flag: zero meant an uncapped dispatch. New
+    // capped zero holds are distinct, and unstarted reservations are not spend.
+    const uncapped = sql`case when ${browserHold}->>'uncapped' = 'false' then false
+      when ${browserHold}->>'uncapped' = 'true' then true
+      else coalesce(${normalizedNumericCents(sql`${browserHold}->>'amountCents'`)}, 0) = 0 end`;
+    const dispatched = sql`(${browserUseRuns.providerRunId} is not null or ${browserHold}->>'dispatchCommittedAt' is not null)`;
+    browserColumns[`unknown${index}`] = sql`count(*) filter (where ${browser} and
+      ((${legacyBrowserPending}) or ${browserHold}->>'billingUnknown' = 'true' or (${uncapped} and ${dispatched})))::int`;
     const inWindow = policy.windowKind === "calendar_month_utc"
       ? sql`coalesce(${heartbeatRuns.finishedAt}, ${now.toISOString()}::timestamptz) >= ${start.toISOString()}::timestamptz
         and coalesce(${heartbeatRuns.finishedAt}, ${now.toISOString()}::timestamptz) < ${end.toISOString()}::timestamptz` : sql`true`;
@@ -129,6 +144,7 @@ async function readObservedSpends(db: Db, policies: SpendPolicy[], now: Date): P
   const [runs = {}] = billable.length ? await db.select(runColumns).from(heartbeatRuns).where(or(...runPredicates)) : [];
   const [browser = {}] = billable.length ? await db.select(browserColumns).from(browserUseRuns)
     .innerJoin(browserUseSessions, and(eq(browserUseSessions.id, browserUseRuns.sessionId), eq(browserUseSessions.companyId, browserUseRuns.companyId)))
+    .leftJoin(issues, and(eq(issues.id, browserUseSessions.issueId), eq(issues.companyId, browserUseSessions.companyId)))
     .where(or(...browserPredicates)) : [];
   return policies.map((_, index) => {
     const ledgerCents = normalizeCents(String(ledger[`total${index}`] ?? 0));

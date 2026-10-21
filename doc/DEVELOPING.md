@@ -3106,6 +3106,9 @@ neither provider startup nor termination holds the company accounting lock.
 Hosted browser operations retain their own hold and admitted project in existing
 run metadata. Unknown provider outcomes retain that capacity until accounting
 establishes the charge. Browser holds are separate from their parent run's usage.
+Unfinished uncapped browsers and legacy rows without a reliable exposure record
+remain unknown usage when a new budget is introduced. The existing unpriced-usage
+policy controls admission until their terminal charge is known.
 
 Use a disposable real PostgreSQL database to compare the cost-evaluation boundary:
 

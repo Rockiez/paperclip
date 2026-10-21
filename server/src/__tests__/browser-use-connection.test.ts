@@ -21,6 +21,7 @@ import {
   createDb,
   heartbeatRuns,
   issues,
+  projects,
   toolConnections,
   toolApplications,
   toolCatalogEntries,
@@ -1505,6 +1506,59 @@ const actor = { actorType: "user" as const, actorId: "browser-reviewer" };
       const [row] = await db.select().from(budgetPolicies).where(eq(budgetPolicies.id, policy.policyId));
       expect(await computeObservedSpend(db, row)).toMatchObject({ ledgerCents: "0.0000000", effectiveHeldCents: "0.0000000" });
       expect(await db.select().from(costEvents).where(eq(costEvents.companyId, f.company.id))).toHaveLength(0);
+      await db.update(browserUseRuns).set({ result: null }).where(eq(browserUseRuns.companyId, f.company.id));
+      expect((await computeObservedSpend(db, row)).unknownBrowserRunCount).toBe(0);
+    });
+    it.each(["company", "agent", "project"] as const)("treats a running uncapped browser as unknown when a %s budget is introduced", async scopeType => {
+      for (const legacy of [false, true]) {
+        const f = await fixture();
+        const [project] = await db.insert(projects).values({ companyId: f.company.id, name: "Browser project" }).returning();
+        const [otherProject] = await db.insert(projects).values({ companyId: f.company.id, name: "Unrelated project" }).returning();
+        await db.update(issues).set({ projectId: project.id }).where(eq(issues.id, f.issue.id));
+        const invocation = randomUUID();
+        await expect(f.service.execute(f.binding, f.grant, invocation, "browser_start", { task: "Uncapped running work" })).resolves.toMatchObject({ status: "running" });
+        const [run] = await db.select().from(browserUseRuns).where(eq(browserUseRuns.invocationId, invocation));
+        expect(run.result).toMatchObject({ paperclipBudgetHold: { amountCents: "0.0000000", uncapped: true } });
+        expect(JSON.parse(String(f.request.mock.calls.find(([url, init]) => url.endsWith("/runs") && init.method === "POST")![1].body))).not.toHaveProperty("maxCostUsd");
+        if (legacy) await db.update(browserUseRuns).set({ result: null }).where(eq(browserUseRuns.id, run.id));
+        const scopeId = scopeType === "company" ? f.company.id : scopeType === "agent" ? f.agent.id : project.id;
+        const policy = await budgetService(db).upsertPolicy(f.company.id,
+          { scopeType, scopeId, amount: 100, hardStopEnabled: true }, actor.actorId);
+        const [row] = await db.select().from(budgetPolicies).where(eq(budgetPolicies.id, policy.policyId));
+        expect(await computeObservedSpend(db, row)).toMatchObject({ ledgerCents: "0.0000000", effectiveHeldCents: "0.0000000", unknownBrowserRunCount: 1 });
+        expect((await computeObservedSpend(db, { ...row, scopeType: "project", scopeId: otherProject.id })).unknownBrowserRunCount).toBe(0);
+        expect(await budgetService(db).getInvocationBlock(f.company.id, f.agent.id, { projectId: project.id })).not.toBeNull();
+        f.request.mockClear();
+        await expect(f.service.execute(f.binding, f.grant, randomUUID(), "browser_start", { task: "Must wait for priced work" })).rejects.toThrow();
+        expect(f.request.mock.calls.filter(([url, init]) => url.endsWith("/runs") && init.method === "POST")).toHaveLength(0);
+        await budgetService(db).upsertPolicy(f.company.id,
+          { scopeType, scopeId, amount: 100, hardStopEnabled: true, unpricedUsagePolicy: "allow" }, actor.actorId);
+        expect(await budgetService(db).getInvocationBlock(f.company.id, f.agent.id, { projectId: project.id })).toBeNull();
+        f.complete(); await f.tick();
+        expect(await computeObservedSpend(db, row)).toMatchObject({ ledgerCents: "15.0000000", effectiveHeldCents: "0.0000000", unknownBrowserRunCount: 0 });
+      }
+    });
+    it.each([
+      { label: "explicit capped zero", uncapped: false, state: "held", dispatched: true, status: "running", expected: 0 },
+      { label: "legacy zero cap without a flag", uncapped: undefined, state: "held", dispatched: true, status: "running", expected: 1 },
+      { label: "uncapped before dispatch", uncapped: true, state: "held", dispatched: false, status: "creating", expected: 0 },
+      { label: "failed before dispatch", uncapped: true, state: "released", dispatched: false, status: "failed", expected: 0 },
+    ])("distinguishes $label from unfinished uncapped spending", async item => {
+      const f = await fixture();
+      const [session] = await db.insert(browserUseSessions).values({ companyId: f.company.id, issueId: f.issue.id,
+        agentId: f.agent.id, connectionId: f.connection.connectionId, grantId: f.grant.id, status: "running" }).returning();
+      const invocationId = randomUUID();
+      await db.insert(browserUseRuns).values({ companyId: f.company.id, sessionId: session.id, heartbeatRunId: f.run.id,
+        invocationId, status: item.status, providerRunId: item.dispatched ? randomUUID() : null, eventsDrained: item.status === "failed" ? 1 : 0,
+        result: { paperclipBudgetHold: { invocationId, amountCents: "0.0000000", projectId: null, state: item.state,
+          ...(item.uncapped === undefined ? {} : { uncapped: item.uncapped }),
+          ...(item.dispatched ? { dispatchCommittedAt: new Date().toISOString() } : {}) } } });
+      const policy = await budgetService(db).upsertPolicy(f.company.id,
+        { scopeType: "company", scopeId: f.company.id, amount: 100, hardStopEnabled: true }, actor.actorId);
+      const [row] = await db.select().from(budgetPolicies).where(eq(budgetPolicies.id, policy.policyId));
+      expect(await computeObservedSpend(db, row)).toMatchObject({ ledgerCents: "0.0000000", effectiveHeldCents: "0.0000000", unknownBrowserRunCount: item.expected });
+      const block = await budgetService(db).getInvocationBlock(f.company.id, f.agent.id);
+      expect(Boolean(block)).toBe(item.expected > 0);
     });
     it("blocks new budgeted work after an uncapped browser POST becomes uncertain", async () => {
       const f = await fixture();
