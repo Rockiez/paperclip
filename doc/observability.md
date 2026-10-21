@@ -39,12 +39,14 @@ them.
 
 The operator-gated `paperclip.budgets` tracer records
 `budget.admission.evaluate`, `budget.admission.reserve`,
-`budget.accounting.transaction`, `budget.accounting.lock_wait`,
+`budget.accounting.transaction`, `budget.accounting.settlement`, `budget.accounting.lock_wait`,
 `budget.exposure.evaluate`, `budget.enforcement.deliver`,
-`budget.enforcement.scope`, and `budget.accounting.recover`.
+`budget.enforcement.scope`, `budget.cancellation.deliver`, and `budget.accounting.recover`.
 Transaction spans include commit time. Lock-wait spans cover acquisition of the
-company accounting lock. Enforcement spans measure asynchronous delivery and
-remain separate from provider inference and final remote Stop acknowledgement.
+company accounting lock. Settlement spans cover the ledger and reservation
+transaction. Enforcement spans measure asynchronous delivery; cancellation
+delivery spans start after acquiring a concurrency slot and cover the external
+Stop attempt. Both remain separate from provider inference.
 
 The closed attribute list is `budget.policy_count` (number of applicable
 policies) and `budget.enforcement.queue_delay_ms` (time since the pending policy's

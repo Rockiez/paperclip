@@ -10,6 +10,7 @@ import { PROMPT_INJECTION_DEFAULT_MODEL, PROMPT_INJECTION_POLICY_VERSION, decisi
 import { HttpError, forbidden } from "../errors.js";
 import { aiConnectionService } from "./ai-connections.js";
 import { withAccountingTransaction } from "./accounting-transaction.js";
+import { withBudgetSpan } from "./budget-tracing.js";
 import { budgetServiceInTransaction, type BudgetServiceHooks } from "./budgets.js";
 import { createCostEventInTransaction } from "./costs.js";
 import { logActivity } from "./activity-log.js";
@@ -103,7 +104,7 @@ export function promptInjectionPreventionService(db: Db, options: {
     return { config, connection, userId, agentId, runId, identityContextId, issueId, projectId, actorType: context.actorType, actorId: context.actorId };
   }
   async function settle(invocation: typeof promptInjectionInvocations.$inferSelect, outcome: PromptInjectionProviderOutcome) {
-    await withAccountingTransaction(db, invocation.companyId, async (tx, publications) => {
+    await withBudgetSpan("budget.accounting.settlement", () => withAccountingTransaction(db, invocation.companyId, async (tx, publications) => {
       const [current] = await tx.select().from(promptInjectionInvocations).where(and(eq(promptInjectionInvocations.companyId, invocation.companyId), eq(promptInjectionInvocations.id, invocation.id))).for("update");
       if (!current || current.status !== "running") return;
       const receipt = outcome.receipt;
@@ -134,7 +135,7 @@ export function promptInjectionPreventionService(db: Db, options: {
       if (receipt.costStatus !== "unpriced") await tx.update(budgetReservations).set({ state: outcome.noProviderWork ? "released" : "settled", settledAt: finishedAt }).where(and(
         eq(budgetReservations.companyId, invocation.companyId), eq(budgetReservations.promptInjectionInvocationId, invocation.id), eq(budgetReservations.state, "held"),
       ));
-    });
+    }));
   }
   async function classify(context: PromptInjectionContext, content: string, signal?: AbortSignal): Promise<PromptInjectionModelOutcome & { usage?: DecisionUsage }> {
     signal?.throwIfAborted();

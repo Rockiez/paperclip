@@ -1,5 +1,5 @@
 import type { Db } from "@paperclipai/db";
-import { getStartupTracer } from "../instrumentation.js";
+import { withBudgetSpan } from "./budget-tracing.js";
 import type { createDeliveryWorkCoordinator } from "./delivery-work-coordinator.js";
 import { DELIVERY_QUEUES } from "./delivery-work-notifications.js";
 import {
@@ -40,9 +40,7 @@ export function registerBudgetEnforcementWork(db: Db, coordinator: Coordinator, 
         if (!reconciling) startup = false;
       }
       if (signal.aborted) return;
-      const span = getStartupTracer("paperclip.budgets").startSpan("budget.enforcement.deliver");
-      try { await deliverBudgetEnforcement(db, hooks); }
-      finally { span.end(); }
+      await withBudgetSpan("budget.enforcement.deliver", () => deliverBudgetEnforcement(db, hooks));
     },
     async hasPending() {
       const [pending, next] = await Promise.all([
@@ -64,9 +62,7 @@ export function registerCostAccountingWork(db: Db, coordinator: Coordinator, rec
     runDuringDrain: true,
     async run(signal) {
       if (signal.aborted) return;
-      const span = getStartupTracer("paperclip.budgets").startSpan("budget.accounting.recover");
-      try { await reconcile(); }
-      finally { span.end(); }
+      await withBudgetSpan("budget.accounting.recover", reconcile);
     },
     async hasPending() {
       const work = await readCostAccountingWork(db);

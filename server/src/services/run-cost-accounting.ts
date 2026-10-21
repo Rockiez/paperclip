@@ -2,6 +2,7 @@ import { usdToUnits, unitsToCents } from "@paperclipai/shared";
 import { and, asc, eq, inArray, or, sql } from "drizzle-orm";
 import { accountingRuntimeBaselines, budgetReservations, agentRuntimeState, agents, costEvents, heartbeatRuns, nativeRunFinalizations, issues, projects, decisionInvocations, promptInjectionInvocations, type Db } from "@paperclipai/db";
 import { withAccountingTransaction } from "./accounting-transaction.js";
+import { withBudgetSpan } from "./budget-tracing.js";
 import { conflict } from "../errors.js";
 import { createCostEventInTransaction } from "./costs.js";
 import { budgetServiceInTransaction, type BudgetServiceHooks } from "./budgets.js";
@@ -27,7 +28,7 @@ export async function accountRunCost(db: Db, runId: string, hooks: BudgetService
   const index = identity.pending && !identity.accountedAt && terminalStatuses.includes(identity.status)
     ? receiptIndex ?? await indexPendingUsageReceipts() : undefined;
   let recoveredFiles: string[] = [];
-  const accounted = await withAccountingTransaction(db, identity.companyId, async (tx, publications) => {
+  const accounted = await withBudgetSpan("budget.accounting.settlement", () => withAccountingTransaction(db, identity.companyId, async (tx, publications) => {
     // Native recovery owns the issue before updating its run. Acquire the
     // charge's issue FK lock first so inserting it cannot reverse that order.
     const issueId = text(identity.issueId);
@@ -152,7 +153,7 @@ export async function accountRunCost(db: Db, runId: string, hooks: BudgetService
     }).where(eq(agentRuntimeState.agentId, run.agentId));
     await tx.update(heartbeatRuns).set({ costAccountingPending: false, costAccountedAt: new Date(), accountingProjectionVersion: "v2", accountingLastError: null, accountingLastAttemptAt: new Date() }).where(eq(heartbeatRuns.id, run.id));
     return true;
-  });
+  }));
   for (const file of recoveredFiles) {
     try { await fs.rm(file, { force: true }); }
     catch (error) { logger.warn({ err: error, runId }, "Accounting committed; recovered receipt cleanup will retry"); }

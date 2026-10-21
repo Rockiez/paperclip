@@ -15,6 +15,7 @@ import { aiConnectionService } from "./ai-connections.js";
 import { accessService } from "./access.js";
 import { type AuthorizationActor } from "./authorization.js";
 import { withAccountingTransaction } from "./accounting-transaction.js";
+import { withBudgetSpan } from "./budget-tracing.js";
 import { budgetServiceInTransaction, type BudgetServiceHooks } from "./budgets.js";
 import { createCostEventInTransaction } from "./costs.js";
 import { logActivity } from "./activity-log.js";
@@ -139,7 +140,7 @@ export function decisionModelService(db: Db, options: { provider?: typeof runDec
     return (context: DecisionContext) => { let result = cache.get(context); if (!result) { result = availability(context); cache.set(context, result); } return result; };
   }
   async function settle(invocation: typeof decisionInvocations.$inferSelect, outcome: DecisionProviderOutcome) {
-    await withAccountingTransaction(db, invocation.companyId, async (tx, publications) => {
+    await withBudgetSpan("budget.accounting.settlement", () => withAccountingTransaction(db, invocation.companyId, async (tx, publications) => {
       const [current] = await tx.select().from(decisionInvocations).where(and(eq(decisionInvocations.companyId, invocation.companyId), eq(decisionInvocations.id, invocation.id))).for("update");
       if (!current || current.status !== "running") return;
       const receipt = outcome.receipt;
@@ -170,7 +171,7 @@ export function decisionModelService(db: Db, options: { provider?: typeof runDec
       if (receipt.costStatus !== "unpriced") await tx.update(budgetReservations).set({ state: outcome.noProviderWork ? "released" : "settled", settledAt: finishedAt }).where(and(
         eq(budgetReservations.companyId, invocation.companyId), eq(budgetReservations.decisionInvocationId, invocation.id), eq(budgetReservations.state, "held"),
       ));
-    });
+    }));
   }
   async function decide(context: DecisionContext, request: DecisionRequest, signal?: AbortSignal): Promise<DecisionResult> {
     const parsed = decisionRequestSchema.safeParse(request);

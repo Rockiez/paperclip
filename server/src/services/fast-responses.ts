@@ -59,6 +59,7 @@ import {
   type ActivityPublication,
 } from "./activity-log.js";
 import { withAccountingTransaction } from "./accounting-transaction.js";
+import { withBudgetSpan } from "./budget-tracing.js";
 import {
   budgetServiceInTransaction,
   type BudgetServiceHooks,
@@ -563,7 +564,7 @@ export function fastResponseService(
       );
   }
   async function settle(request: Request, outcome: FastResponseOutcome) {
-    await withAccountingTransaction(
+    await withBudgetSpan("budget.accounting.settlement", () => withAccountingTransaction(
       db,
       request.companyId,
       async (tx, publications) => {
@@ -656,7 +657,7 @@ export function fastResponseService(
               ),
             );
       },
-    );
+    ));
 
   }
   async function process(

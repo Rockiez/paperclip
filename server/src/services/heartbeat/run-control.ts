@@ -58,6 +58,7 @@ import {
 } from "../adapter-execution-control.js";
 import { AdapterStopTimeoutError } from "../adapter-stop-timeout.js";
 import { budgetCancellationScopePredicate, pendingBudgetRunCancellationPredicate } from "./budget-cancellation.js";
+import { withBudgetSpan } from "../budget-tracing.js";
 import { captureException } from "../../sentry.js";
 import { randomUUID } from "node:crypto";
 import {
@@ -148,7 +149,7 @@ async function withBudgetStopDelivery<T>(db: Db, work: () => Promise<T>): Promis
   if (limit.active >= 4) await new Promise<void>(resolve => limit.waiting.push(resolve));
   else limit.active += 1;
   try {
-    return await work();
+    return await withBudgetSpan("budget.cancellation.deliver", work);
   } finally {
     const next = limit.waiting.shift();
     if (next) next();
