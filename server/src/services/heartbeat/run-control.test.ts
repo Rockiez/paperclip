@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { Db } from "@paperclipai/db";
-import { activityLog, agents, agentWakeupRequests, caseEvents, caseHandoffs, cases, companies, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, environmentLeases, heartbeatRuns, issues, nativeRunFinalizations, projects } from "@paperclipai/db";
+import { activityLog, agents, agentWakeupRequests, budgetPolicies, caseEvents, caseHandoffs, cases, companies, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, environmentLeases, heartbeatRuns, issues, nativeRunFinalizations, projects } from "@paperclipai/db";
 import { eq, inArray, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
@@ -19,11 +19,15 @@ import { createHeartbeatRunState } from "./run-state.js";
 import { createHeartbeatRunPreparation } from "./run-preparation.js";
 import { createHeartbeatLifecycle, type HeartbeatLifecycleDependencies } from "./run-lifecycle.js";
 import { createHeartbeatRunControl, type HeartbeatRunControlDependencies } from "./run-control.js";
+import { listPendingBudgetCancellationScopes } from "./budget-cancellation.js";
 import { preserveCancelledNativeWorkspaces } from "../native-runtime/native-failed-workspace-recovery.js";
 import { createPostgresRunDispatchAdapter } from "../../modules/run-dispatch/adapters/postgres.js";
 import { caseHandoffService } from "../case-handoffs.js";
 import { instanceSettingsService } from "../instance-settings.js";
 import { issueService } from "../issues.js";
+import { persistUsageReceipt } from "../usage-receipts.js";
+import { registerBudgetEnforcementWork } from "../budget-enforcement-worker.js";
+import { createDeliveryWorkCoordinator } from "../delivery-work-coordinator.js";
 
 vi.mock("../live-events.js", () => ({ publishLiveEvent: vi.fn() }));
 vi.mock("../adapter-execution-control.js", async (importOriginal) => {
@@ -715,6 +719,300 @@ describe.skipIf(!support.supported)("heartbeat run-control database wiring", () 
     expect(deps.setRunStatusFromLive).not.toHaveBeenCalled();
     expect(deps.finalizeAgentStatus).not.toHaveBeenCalled();
     expect(terminateLocalService).not.toHaveBeenCalled();
+  });
+
+  it("does not apply an earlier enforcement generation after a budget increase", async () => {
+    const { company, agent } = await fixture();
+    const [policy] = await db.insert(budgetPolicies).values({ companyId: company.id,
+      scopeType: "agent", scopeId: agent.id, windowKind: "lifetime", amount: 10_000,
+      enforcementVersion: 2, enforcementDeliveredVersion: 1 }).returning();
+    const run = await liveRun(company.id, agent.id);
+    const [wake] = await db.insert(agentWakeupRequests).values({ companyId: company.id, agentId: agent.id,
+      source: "assignment", status: "queued" }).returning();
+    await createHeartbeatRunControl(db, callbacks(db)).cancelBudgetScopeWork({ companyId: company.id,
+      scopeType: "agent", scopeId: agent.id, enforcement: { policyId: policy.id, version: 1 } });
+    expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id)))[0]).toMatchObject({ status: "running", resultJson: null });
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wake.id)))[0].status).toBe("queued");
+    expect(terminateLocalService).not.toHaveBeenCalled();
+  });
+
+  it("fences every affected run and queued wake before bounded provider delivery", async () => {
+    const { company, agent } = await fixture();
+    const runs = await db.insert(heartbeatRuns).values(Array.from({ length: 5 }, () => ({
+      companyId: company.id, agentId: agent.id, status: "running", runtimeMode: "legacy", runtimeModeResolvedAt: new Date(),
+    }))).returning();
+    const [unrelatedAgent] = await db.insert(agents).values({ companyId: company.id, name: "Unrelated" }).returning();
+    const unrelated = await db.insert(heartbeatRuns).values({ companyId: company.id,
+      agentId: unrelatedAgent.id, status: "running", runtimeMode: "legacy" }).returning().then(rows => rows[0]);
+    const wakes = await db.insert(agentWakeupRequests).values([
+      { companyId: company.id, agentId: agent.id, source: "assignment", status: "queued" },
+      { companyId: company.id, agentId: agent.id, source: "assignment", status: "deferred_issue_execution" },
+      { companyId: company.id, agentId: unrelatedAgent.id, source: "assignment", status: "queued" },
+    ]).returning();
+    runs.forEach((run, i) => runningProcesses.set(run.id, {
+      child: { pid: 425000 + i } as never, graceSec: 4, processGroupId: 425000 + i,
+    }));
+    const releases = new Map<number, () => void>();
+    let active = 0, maximumActive = 0, releaseAll = false;
+    vi.mocked(terminateLocalService).mockImplementation(async input => {
+      active += 1;
+      maximumActive = Math.max(maximumActive, active);
+      if (!releaseAll) await new Promise<void>(resolve => releases.set(input.pid, resolve));
+      active -= 1;
+    });
+    const deps = callbacks(db);
+    const delivery = createHeartbeatRunControl(db, deps).cancelBudgetScopeWork({ companyId: company.id,
+      scopeType: "agent", scopeId: agent.id });
+    try {
+      await vi.waitFor(() => expect(releases.size).toBe(4));
+      const persisted = await db.select().from(heartbeatRuns).where(inArray(heartbeatRuns.id, runs.map(run => run.id)));
+      expect(persisted.every(run => run.status === "running" && Boolean(run.resultJson?.startupCancellation))).toBe(true);
+      const pendingWakes = await db.select().from(agentWakeupRequests).where(inArray(agentWakeupRequests.id, wakes.map(wake => wake.id)));
+      expect(wakes.map(wake => pendingWakes.find(row => row.id === wake.id)?.status)).toEqual(["cancelled", "cancelled", "queued"]);
+      expect((await deps.getRun(unrelated.id))?.resultJson).toBeNull();
+      // A slow first Stop must not stop another slot from making progress.
+      const firstPid = releases.keys().next().value!;
+      const otherPid = [...releases.keys()].find(pid => pid !== firstPid)!;
+      releases.get(otherPid)!();
+      await vi.waitFor(() => expect(releases.size).toBe(5));
+      expect(maximumActive).toBe(4);
+      expect(active).toBe(4);
+    } finally {
+      releaseAll = true;
+      releases.forEach(release => release());
+      await delivery;
+    }
+    expect((await db.select().from(heartbeatRuns).where(inArray(heartbeatRuns.id, runs.map(run => run.id))))
+      .every(run => run.status === "cancelled" && (run.resultJson?.executionCancellation as { state?: string })?.state === "acknowledged")).toBe(true);
+    expect((await deps.getRun(unrelated.id))?.status).toBe("running");
+  });
+
+  it("wakes scoped Stop delivery from a partial usage overrun without waiting for adapter termination", async () => {
+    const { company, agent } = await fixture();
+    const [project, otherProject] = await db.insert(projects).values([
+      { companyId: company.id, name: "Over budget" }, { companyId: company.id, name: "Still admitted" },
+    ]).returning();
+    const sourceId = randomUUID();
+    const run = await liveRun(company.id, agent.id);
+    await db.update(heartbeatRuns).set({ contextSnapshot: { projectId: project.id }, costAccountingPending: true,
+      usageJson: { accountingReceiptSourceId: sourceId, accountingReceiptSequence: 0,
+        accountingReceiptReady: false, ledgerScope: { projectId: project.id } },
+    }).where(eq(heartbeatRuns.id, run.id));
+    const [queued, unrelated] = await db.insert(heartbeatRuns).values([
+      { companyId: company.id, agentId: agent.id, status: "queued", runtimeMode: "legacy", contextSnapshot: { projectId: project.id } },
+      { companyId: company.id, agentId: agent.id, status: "running", runtimeMode: "legacy", contextSnapshot: { projectId: otherProject.id } },
+    ]).returning();
+    const wakes = await db.insert(agentWakeupRequests).values([
+      { companyId: company.id, agentId: agent.id, source: "assignment", status: "queued", payload: { projectId: project.id } },
+      { companyId: company.id, agentId: agent.id, source: "assignment", status: "deferred_issue_execution", payload: { projectId: project.id } },
+      { companyId: company.id, agentId: agent.id, source: "assignment", status: "queued", payload: { projectId: otherProject.id } },
+    ]).returning();
+    const [policy] = await db.insert(budgetPolicies).values({ companyId: company.id, scopeType: "project",
+      scopeId: project.id, windowKind: "lifetime", amount: 100, notifyEnabled: false }).returning();
+    let releaseTermination!: () => void;
+    const termination = new Promise<void>(resolve => { releaseTermination = resolve; });
+    vi.mocked(terminateLocalService).mockImplementation(async () => termination);
+    const deps = callbacks(db);
+    const control = createHeartbeatRunControl(db, deps);
+    const errors = vi.fn();
+    const coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, onError: errors });
+    const worker = registerBudgetEnforcementWork(db, coordinator, { cancelWorkForScope: control.cancelBudgetScopeWork });
+    try {
+      // Drain startup recovery first: only the receipt's committed notification
+      // may wake the idle worker below. Do not call wake or deliver explicitly.
+      await worker.ready;
+      expect(terminateLocalService).not.toHaveBeenCalled();
+      expect(coordinator.nextWakeAt()).toBeNull();
+      const startedAt = performance.now();
+      await persistUsageReceipt(db, { schema: "paperclip/accounting-receipt/v1", id: randomUUID(),
+        companyId: company.id, runId: run.id, sourceId, sequence: 1, receivedAt: new Date().toISOString(),
+        adapterType: agent.adapterType, receipt: { complete: false, usageBasis: "per_run", costUsd: 1.1,
+          provider: "test", biller: "test", model: "budget-stop-fixture", billingType: "metered_api", costStatus: "unpriced" },
+      });
+      const receiptReturnedAt = performance.now();
+      await vi.waitFor(async () => {
+        const persisted = await deps.getRun(run.id);
+        expect(persisted).toMatchObject({ status: "running", usageJson: { budgetExposure: { sequence: 1, costCents: "110.0000000" } },
+          resultJson: { startupCancellation: { budgetEnforcement: { policyId: policy.id, scopeType: "project", scopeId: project.id } } } });
+        expect(terminateLocalService).toHaveBeenCalledTimes(1);
+      }, { interval: 10, timeout: 3_000 });
+      const fenceObservedAt = performance.now();
+      const fenced = await deps.getRun(run.id);
+      expect(fenced?.resultJson?.executionCancellation).toBeUndefined();
+      expect((await deps.getRun(queued.id))?.resultJson?.startupCancellation).toBeTruthy();
+      const persistedWakes = await db.select().from(agentWakeupRequests).where(inArray(agentWakeupRequests.id, wakes.map(wake => wake.id)));
+      expect(wakes.map(wake => persistedWakes.find(row => row.id === wake.id)?.status)).toEqual(["cancelled", "cancelled", "queued"]);
+      const [pending] = await db.select().from(budgetPolicies).where(eq(budgetPolicies.id, policy.id));
+      expect(pending.enforcementVersion).toBeGreaterThan(pending.enforcementDeliveredVersion);
+
+      const requestStartedAt = performance.now();
+      let responseTimeout: ReturnType<typeof setTimeout> | undefined;
+      try {
+        const rows = await Promise.race([
+          db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, unrelated.id)),
+          new Promise<never>((_, reject) => { responseTimeout = setTimeout(() => reject(new Error("Unrelated database request blocked by Stop delivery")), 1_000); }),
+        ]);
+        expect(rows[0]).toMatchObject({ status: "running", resultJson: null });
+      } finally { clearTimeout(responseTimeout); }
+      const unrelatedRequestMs = performance.now() - requestStartedAt;
+      const terminationReleasedAt = performance.now();
+      releaseTermination();
+      await vi.waitFor(async () => {
+        expect(await deps.getRun(run.id)).toMatchObject({ status: "cancelled", resultJson: { executionCancellation: { state: "acknowledged" } } });
+        const [delivered] = await db.select().from(budgetPolicies).where(eq(budgetPolicies.id, policy.id));
+        expect(delivered.enforcementDeliveredVersion).toBe(delivered.enforcementVersion);
+      }, { interval: 10, timeout: 3_000 });
+      expect((await deps.getRun(unrelated.id))?.status).toBe("running");
+      expect(errors).not.toHaveBeenCalled();
+      console.info("Partial usage budget Stop timing", { receiptMs: Math.round(receiptReturnedAt - startedAt),
+        receiptReturnToFenceMs: Math.round(fenceObservedAt - receiptReturnedAt), unrelatedRequestMs: Math.round(unrelatedRequestMs),
+        controlledTerminationWaitMs: Math.round(terminationReleasedAt - fenceObservedAt),
+        terminationReleaseToAcknowledgementMs: Math.round(performance.now() - terminationReleasedAt) });
+    } finally {
+      releaseTermination();
+      await coordinator.stop();
+    }
+  });
+
+  it("drains other provider stops after a failed delivery and retries the unfinished run", async () => {
+    const { company, agent } = await fixture();
+    const failed = await liveRun(company.id, agent.id);
+    const [other] = await db.insert(heartbeatRuns).values({ companyId: company.id, agentId: agent.id,
+      status: "running", runtimeMode: "legacy", runtimeModeResolvedAt: new Date() }).returning();
+    runningProcesses.set(other.id, { child: { pid: 434343 } as never, graceSec: 4, processGroupId: 434343 });
+    vi.mocked(terminateLocalService).mockImplementation(async input => {
+      if (input.pid === 424242) throw new Error("provider unreachable");
+    });
+    const deps = callbacks(db);
+    const control = createHeartbeatRunControl(db, deps);
+    const scope = { companyId: company.id, scopeType: "agent" as const, scopeId: agent.id };
+    await expect(control.cancelBudgetScopeWork(scope)).rejects.toThrow("Budget cancellation delivery remains pending");
+    expect((await deps.getRun(other.id))?.status).toBe("cancelled");
+    expect(await deps.getRun(failed.id)).toMatchObject({ status: "running", resultJson: { startupCancellation: expect.any(Object) } });
+    expect(runningProcesses.has(failed.id)).toBe(true);
+    vi.mocked(terminateLocalService).mockResolvedValue(undefined);
+    await control.cancelBudgetScopeWork(scope);
+    expect(await deps.getRun(failed.id)).toMatchObject({ status: "cancelled", resultJson: { executionCancellation: { state: "acknowledged" } } });
+  });
+
+  it("shares four Stop slots across independent scopes and service instances", async () => {
+    const { company, agent } = await fixture();
+    const [otherAgent] = await db.insert(agents).values({ companyId: company.id, name: "Another scope" }).returning();
+    const runs = await db.insert(heartbeatRuns).values([agent.id, otherAgent.id].flatMap(agentId =>
+      Array.from({ length: 3 }, () => ({ companyId: company.id, agentId,
+        status: "running", runtimeMode: "legacy", runtimeModeResolvedAt: new Date() })))).returning();
+    runs.forEach((run, i) => runningProcesses.set(run.id, {
+      child: { pid: 435000 + i } as never, graceSec: 4, processGroupId: 435000 + i,
+    }));
+    let active = 0, maximumActive = 0, releaseAll = false;
+    const releases = new Map<number, () => void>();
+    vi.mocked(terminateLocalService).mockImplementation(async input => {
+      active += 1;
+      maximumActive = Math.max(maximumActive, active);
+      if (!releaseAll) await new Promise<void>(resolve => releases.set(input.pid, resolve));
+      active -= 1;
+    });
+    const deliveries = [agent, otherAgent].map(selected => createHeartbeatRunControl(db, callbacks(db))
+      .cancelBudgetScopeWork({ companyId: company.id, scopeType: "agent", scopeId: selected.id }));
+    try {
+      await vi.waitFor(() => expect(releases.size).toBe(4));
+      expect(maximumActive).toBe(4);
+      expect((await db.select().from(heartbeatRuns).where(inArray(heartbeatRuns.id, runs.map(run => run.id))))
+        .every(run => Boolean(run.resultJson?.startupCancellation))).toBe(true);
+      releases.values().next().value!();
+      await vi.waitFor(() => expect(releases.size).toBe(5));
+      expect(maximumActive).toBe(4);
+    } finally {
+      releaseAll = true;
+      releases.forEach(release => release());
+      await Promise.all(deliveries);
+    }
+  });
+
+  it("blocks retry promotion after the budget batch commits but before Stop delivery", async () => {
+    const { company, agent } = await fixture();
+    const [run] = await db.insert(heartbeatRuns).values({ companyId: company.id, agentId: agent.id,
+      status: "scheduled_retry", runtimeMode: "legacy", runtimeModeResolvedAt: new Date(),
+      scheduledRetryAt: new Date(), scheduledRetryReason: "transient_failure" }).returning();
+    const deps = callbacks(db);
+    const getAgent = deps.getAgent.getMockImplementation()!;
+    let entered!: () => void, release!: () => void;
+    const deliveryEntered = new Promise<void>(resolve => { entered = resolve; });
+    const continueDelivery = new Promise<void>(resolve => { release = resolve; });
+    deps.getAgent.mockImplementationOnce(async id => { entered(); await continueDelivery; return getAgent(id); });
+    const cancellation = createHeartbeatRunControl(db, deps).cancelBudgetScopeWork({ companyId: company.id,
+      scopeType: "agent", scopeId: agent.id });
+    try {
+      await deliveryEntered;
+      expect(await createPostgresRunDispatchAdapter(db).promoteOrCancelDueRetry({
+        companyId: company.id, runId: run.id, now: new Date(),
+      })).toMatchObject({ outcome: "not_promoted" });
+      expect(await deps.getRun(run.id)).toMatchObject({ status: "scheduled_retry",
+        resultJson: { startupCancellation: expect.any(Object) } });
+    } finally {
+      release();
+      await cancellation;
+    }
+    expect(await deps.getRun(run.id)).toMatchObject({ status: "cancelled" });
+  });
+
+  it("recovers a committed Stop after its policy was deleted without fencing newly admitted work", async () => {
+    const { company, agent } = await fixture();
+    const oldRun = await liveRun(company.id, agent.id);
+    const [newRun] = await db.insert(heartbeatRuns).values({ companyId: company.id, agentId: agent.id,
+      status: "queued", runtimeMode: "legacy" }).returning();
+    const intent = { companyId: company.id, scopeType: "agent", scopeId: agent.id,
+      policyId: randomUUID(), version: 1 };
+    await db.update(heartbeatRuns).set({ resultJson: { startupCancellation: {
+      requestedAt: new Date().toISOString(), budgetEnforcement: intent,
+    } } }).where(eq(heartbeatRuns.id, oldRun.id));
+    const scopes = await listPendingBudgetCancellationScopes(db);
+    expect(scopes).toHaveLength(1);
+    const deps = callbacks(db);
+    await createHeartbeatRunControl(db, deps).cancelBudgetScopeWork(scopes[0]);
+    expect(await deps.getRun(oldRun.id)).toMatchObject({ status: "cancelled",
+      resultJson: { startupCancellation: { budgetEnforcement: { deliveredAt: expect.any(String) } } } });
+    expect(await deps.getRun(newRun.id)).toMatchObject({ status: "queued", resultJson: null });
+    expect(await listPendingBudgetCancellationScopes(db)).toEqual([]);
+  });
+
+  it("retains a terminal budget Stop until actual stop acknowledgement exists", async () => {
+    const { company, agent } = await fixture();
+    const [run] = await db.insert(heartbeatRuns).values({ companyId: company.id, agentId: agent.id,
+      status: "cancelled", runtimeMode: "legacy", startedAt: new Date(), resultJson: {
+        startupCancellation: { budgetEnforcement: { companyId: company.id, scopeType: "agent", scopeId: agent.id,
+          policyId: randomUUID(), version: 1 } },
+      } }).returning();
+    const control = createHeartbeatRunControl(db, callbacks(db));
+    const [scope] = await listPendingBudgetCancellationScopes(db);
+    await expect(control.cancelBudgetScopeWork(scope)).rejects.toThrow("Budget cancellation delivery remains pending");
+    expect(await listPendingBudgetCancellationScopes(db)).toHaveLength(1);
+    expect(terminateLocalService).not.toHaveBeenCalled();
+    await db.update(heartbeatRuns).set({ resultJson: { ...run.resultJson,
+      executionCancellation: { state: "acknowledged", acknowledgedAt: new Date().toISOString() },
+    } }).where(eq(heartbeatRuns.id, run.id));
+    await control.cancelBudgetScopeWork(scope);
+    expect(await listPendingBudgetCancellationScopes(db)).toEqual([]);
+  });
+
+  it("moves an attempted failed Stop behind another pending scope", async () => {
+    const { company, agent } = await fixture();
+    const [otherAgent] = await db.insert(agents).values({ companyId: company.id, name: "Later recovery" }).returning();
+    await db.insert(heartbeatRuns).values([agent, otherAgent].map((selected, index) => ({
+      companyId: company.id, agentId: selected.id, status: "cancelled", runtimeMode: "legacy",
+      resultJson: { startupCancellation: { requestedAt: `2020-01-0${index + 1}T00:00:00.000Z`,
+        budgetEnforcement: { companyId: company.id, scopeType: "agent", scopeId: selected.id,
+          policyId: randomUUID(), version: 1 } } },
+    })));
+    const [first] = await listPendingBudgetCancellationScopes(db, 1);
+    expect(first.scopeId).toBe(agent.id);
+    await expect(createHeartbeatRunControl(db, callbacks(db)).cancelBudgetScopeWork(first))
+      .rejects.toThrow("Budget cancellation delivery remains pending");
+    const [next] = await listPendingBudgetCancellationScopes(db, 1);
+    expect(next.scopeId).toBe(otherAgent.id);
+    const [attempted] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agent.id));
+    expect((attempted.resultJson?.startupCancellation as { budgetEnforcement?: { lastAttemptAt?: string } })
+      ?.budgetEnforcement?.lastAttemptAt).toEqual(expect.any(String));
   });
 
   it("limits project budget cancellation by company, effective project, and admission cutoff", async () => {
