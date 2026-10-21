@@ -1,3 +1,4 @@
+import * as pluginWorkspaces from "../plugin-workspaces.js";
 import * as platformProof from "./native-workspace-platform-proof.js";
 import { currentNativeControllerIdentity } from "./native-restart-recovery.js";
 import { nativeSha256 } from "./canonical.js";
@@ -721,6 +722,22 @@ describe("native workspace finalization recovery", () => {
       ));
       expect(operations).toHaveLength(1);
     } finally { release(); await first; spy.mockRestore(); }
+  });
+
+  it.each(["plugin", "adapter_managed"])("resumes accepted work without Core files for %s storage", async providerType => {
+    const [workspace] = await db.insert(executionWorkspaces).values({ companyId, projectId,
+      name: "Plugin-only work", providerType, providerRef: "provider:opaque-worktree", cwd: "/workspaces/plugin-only",
+      mode: "isolated_workspace", strategyType: providerType === "plugin" ? "git_worktree" : "project_primary",
+      branchName: "task-branch", metadata: providerType === "plugin" ? {} : { runnerTaskWorkspaceOwner: { agentId } } }).returning();
+    const seeded = await seedRun({ executionWorkspaceId: workspace.id, title: "Plugin result before controller restart" });
+    const inspect = vi.spyOn(pluginWorkspaces, "inspectPluginWorkspace").mockResolvedValue({ kind: "inspection",
+      branchName: "task-branch", headSha: "a".repeat(40), hasDirtyTrackedFiles: true, hasUntrackedFiles: false,
+      hasLocalOnlyData: true, isMergedIntoBase: false, remotelyRecoverable: false });
+    try {
+      expect(await resumeNativeWorkspaceFinalization({ db, runId: seeded.runId })).toMatchObject({ status: "succeeded" });
+      if (providerType === "plugin") expect(inspect).toHaveBeenCalledWith(db, undefined, expect.objectContaining({ id: workspace.id }));
+      else expect(inspect).not.toHaveBeenCalled();
+    } finally { inspect.mockRestore(); }
   });
 
   it("records directory-only recovery without inventing an execution-workspace foreign key", async () => {

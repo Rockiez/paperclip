@@ -97,6 +97,8 @@ A terminal phase does not prove process termination.
 Return `executionStopped: true` only after the task and its descendants stop.
 Return `sessionStateAvailable: true` only when the suspended state remains usable.
 Keep retained state when Core completes the task.
+Core checks managed plugin workspaces through their storage provider before
+completion, including after a restart. Core does not inspect these folders locally.
 
 The task contract exposes two checkpoint operations:
 

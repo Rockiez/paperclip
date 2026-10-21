@@ -1,3 +1,4 @@
+import type { WorkspaceWorkers } from "../plugin-workspaces.js";
 import { recoverLegacyUnsafeWorkspaceExports } from "./native-workspace-export-recovery.js";
 import { hasPendingNativeChildCompletion } from "./native-child-completion-delivery.js";
 import { dismissAutomaticCompletionReviews, decisionHasRetiredAutomaticReview } from "./automatic-completion-reviews.js";
@@ -624,6 +625,7 @@ export async function claimNativeSessionResumptions(input: {
 }
 
 type NativeReconciliationOptions = {
+  pluginWorkerManager?: WorkspaceWorkers;
   environmentRuntime?: EnvironmentRuntimeService;
   onWorkspaceSettled?: (input: {
     runId: string;
@@ -1040,6 +1042,7 @@ async function reconcileNativeFinalizationsPass(
         db,
         runId: row.runId,
         environmentRuntime: options.environmentRuntime,
+        pluginWorkerManager: options.pluginWorkerManager,
       });
       // Busy is ownership, not another failed export or retry-budget debit.
       if (!operation) continue;

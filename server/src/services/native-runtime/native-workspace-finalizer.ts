@@ -1,3 +1,5 @@
+import { inspectPluginWorkspaceForFinalization } from "./native-plugin-workspace-finalization.js";
+import type { WorkspaceWorkers } from "../plugin-workspaces.js";
 import { restoreNativeWorkspaceBestEffort } from "./native-workspace-best-effort.js";
 import { withNativeWorkspaceFinalizationOwnership } from "./native-workspace-finalization-ownership.js";
 import fs from "node:fs/promises";
@@ -51,9 +53,11 @@ export async function resumeNativeWorkspaceFinalization(input: {
   db: Db;
   runId: string;
   environmentRuntime?: EnvironmentRuntimeService;
+  pluginWorkerManager?: WorkspaceWorkers;
 }) {
   const bound = await input.db.select({
     companyId: heartbeatRuns.companyId,
+    agentId: heartbeatRuns.agentId,
     runtimeMode: heartbeatRuns.runtimeMode,
     runnerProfileJson: heartbeatRuns.runnerProfileJson,
     issueId: nativeRunFinalizations.issueId,
@@ -237,6 +241,13 @@ export async function resumeNativeWorkspaceFinalization(input: {
           return workspaceSyncFailure(code);
         }
       }
+      const pluginWorkspace = workspace
+        ? await inspectPluginWorkspaceForFinalization(input.db, input.pluginWorkerManager, workspace, bound.agentId)
+        : null;
+      await ownership.assertHeld();
+      if (pluginWorkspace) return { status: "succeeded", exitCode: 0,
+        system: "Native workspace finalization used the plugin workspace owner.\n",
+        metadata: { pluginWorkspace } };
       if (!cwd) {
         return {
           status: "failed",
