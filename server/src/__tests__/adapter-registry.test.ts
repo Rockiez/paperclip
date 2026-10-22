@@ -269,6 +269,42 @@ describe("server adapter registry", () => {
     expect(conversationAdapterTypes().filter((type) => type === "opencode_local")).toHaveLength(1);
   });
 
+  it.each([
+    ["http", true],
+    ["http", false],
+    ["process", true],
+    ["process", false],
+  ] as const)("keeps a paused %s override inactive when reloaded with continuation support %s", (type, supported) => {
+    const builtIn = requireServerAdapter(type);
+    const override = { ...externalAdapter, type, supportsConversationContinuation: true };
+    const reloaded = { ...override, supportsConversationContinuation: supported };
+
+    try {
+      registerServerAdapter(override);
+      expect(findActiveServerAdapter(type)).toBe(override);
+      expect(isConversationAdapter(type)).toBe(true);
+
+      expect(setOverridePaused(type, true)).toBe(true);
+      expect(findActiveServerAdapter(type)).toBe(builtIn);
+      expect(isConversationAdapter(type)).toBe(false);
+
+      unregisterServerAdapter(type);
+      registerServerAdapter(reloaded);
+
+      expect(findServerAdapter(type)).toBe(reloaded);
+      expect(findActiveServerAdapter(type)).toBe(builtIn);
+      expect(isConversationAdapter(type)).toBe(false);
+      expect(conversationAdapterTypes()).not.toContain(type);
+
+      expect(setOverridePaused(type, false)).toBe(true);
+      expect(findActiveServerAdapter(type)).toBe(reloaded);
+      expect(isConversationAdapter(type)).toBe(supported);
+    } finally {
+      registerServerAdapter(builtIn);
+      setOverridePaused(type, false);
+    }
+  });
+
   it("built-in claude_local adapter declares capability flags", () => {
     const adapter = findActiveServerAdapter("claude_local");
     expect(adapter).not.toBeNull();

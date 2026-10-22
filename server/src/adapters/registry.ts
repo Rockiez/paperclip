@@ -1007,7 +1007,10 @@ export function waitForExternalAdapters(): Promise<void> {
 
 /** Built-in conversation adapters are fixed; external ones opt in per module. */
 function trackConversationSupport(adapter: ServerAdapterModule): void {
-  setExternalConversationAdapter(adapter.type, adapter.supportsConversationContinuation === true);
+  setExternalConversationAdapter(
+    adapter.type,
+    !pausedOverrides.has(adapter.type) && adapter.supportsConversationContinuation === true,
+  );
 }
 
 export function registerServerAdapter(adapter: ServerAdapterModule): void {
